@@ -1,0 +1,13 @@
+{
+  "source": "https://github.com/CMU-AIRe/QED-Nano",
+  "commit": "02a4699ed380f8e980a8d44c755b8bfd4e310718",
+  "license": "Apache-2.0",
+  "files": {
+    "proofbench_run.txt": "01f6319829c11a11a554fbc5a7a2d81e5d79b17711c3eb21e698a7e28ca94355",
+    "answerbench_run.txt": "9be7ab551a3a9659b35896beba3d44e5d3ddbfdee2450634a4bf2c1257f28d55",
+    "answerbench.txt": "77852b856741cd08de5e0de49f97aacfacd3e2453a561e71d610bfae0c8703a2",
+    "proofbench.txt": "1f05fe22b17b20bf670daf6faad21e7904827e86002b54fe420513bf2b065cbd",
+    "proofbench_proofbench.txt": "773236ab6cf1bfccfb821657b6fd75801816fc75e85cd6f9d764656328e958af"
+  },
+  "note": "Files are verbatim from eval/configs/prompts at the pinned commit; digests describe upstream bytes. A final newline added by source packaging is ignored during verification."
+}
