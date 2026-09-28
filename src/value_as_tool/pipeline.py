@@ -20,12 +20,14 @@ from typing import Any, Literal
 from .assets import (
     load_model_manifest,
     load_prepared_benchmarks,
+    model_manifest_path,
     prepare_benchmark_assets,
     prepare_model_assets,
 )
 from .benchmarks import BenchmarkItem, QEDPromptSet
 from .client import ChatClient, OpenAIChatClient
 from .config import ExperimentConfig, load_config
+from .harnesses import load_harness
 from .identity import build_experiment_identity, experiment_fingerprint
 from .judging import JUDGE_CONTEXT_TOKENS, JudgeResult, JudgeRunner, build_judge_request
 from .orchestrator import (
@@ -45,7 +47,6 @@ from .schedule import (
 )
 from .schemas import (
     ADJUDICATABLE_TRAJECTORY_STATUSES,
-    Condition,
     TrajectoryResult,
     TrajectoryStatus,
 )
@@ -67,6 +68,7 @@ from .storage import (
     canonical_json,
     read_jsonl,
 )
+from .thinking import build_thinking_budget_processor, derive_thinking_token_profile
 from .tokenization import HuggingFaceTokenCounter
 
 
@@ -222,7 +224,9 @@ def preflight(
             )
         )
 
-    manifest_path = context.asset_root / "models" / "manifest.json"
+    manifest_path = model_manifest_path(context.config)
+    if not manifest_path.exists():
+        manifest_path = context.asset_root / "models" / "manifest.json"
     if manifest_path.exists():
         for role in ("solver", "judge"):
             try:
@@ -342,15 +346,36 @@ def prepare(
 
 
 def _schedule_identity(item: ScheduleItem, *, stage: str) -> dict[str, Any]:
-    return {
+    identity: dict[str, Any] = {
         "stage": stage,
         "ordinal": item.ordinal,
         "run_id": item.run_id,
         "benchmark": item.benchmark,
         "problem_id": item.problem_id,
-        "condition": item.condition.value,
+        "condition": _method_id(item),
         "seed": item.seed,
         "problem_fingerprint": item.problem_fingerprint,
+    }
+    identity.update(_harness_identity(item))
+    return identity
+
+
+def _method_id(item: ScheduleItem) -> str:
+    if item.harness_id:
+        return item.harness_id
+    if item.condition is not None:
+        return item.condition.value
+    raise ValueError(f"schedule item {item.run_id!r} has no method identity")
+
+
+def _harness_identity(item: ScheduleItem) -> dict[str, Any]:
+    if item.harness_id is None:
+        return {}
+    return {
+        "harness_id": item.harness_id,
+        "harness_entrypoint": item.harness_entrypoint,
+        "harness_source_sha256": item.harness_source_sha256,
+        "harness_access": item.harness_access,
     }
 
 
@@ -366,7 +391,17 @@ def _benchmark_item(item: ScheduleItem) -> BenchmarkItem:
     )
 
 
-def _orchestrator_config(config: ExperimentConfig) -> OrchestratorConfig:
+def _orchestrator_config(
+    config: ExperimentConfig,
+    *,
+    token_counter: Any | None = None,
+) -> OrchestratorConfig:
+    thinking_processor = QWEN3_THINKING_BUDGET_PROCESSOR
+    tokenizer = getattr(token_counter, "tokenizer", None)
+    if tokenizer is not None:
+        thinking_processor = build_thinking_budget_processor(
+            derive_thinking_token_profile(tokenizer)
+        )
     return OrchestratorConfig(
         model=config.models.solver.name,
         total_generated_tokens=config.budget.generated_tokens,
@@ -381,6 +416,11 @@ def _orchestrator_config(config: ExperimentConfig) -> OrchestratorConfig:
         max_subagents=config.subagents.max_children,
         final_candidate_reserve_tokens=config.subagents.final_candidate_reserve_tokens,
         subagent_context_max_chars=config.subagents.max_context_chars,
+        value_tool_max_queries=config.value_tool.max_queries,
+        value_verifier_cap=config.value_tool.verifier_tokens,
+        value_final_response_reserve_tokens=(
+            config.value_tool.final_response_reserve_tokens
+        ),
         temperature=config.sampling.temperature,
         top_p=config.sampling.top_p,
         top_k=config.sampling.top_k,
@@ -391,7 +431,7 @@ def _orchestrator_config(config: ExperimentConfig) -> OrchestratorConfig:
             "chat_template_kwargs": {"enable_thinking": config.sampling.enable_thinking}
         },
         thinking_content_reserve_tokens=config.sampling.thinking_content_reserve_tokens,
-        thinking_budget_processor=QWEN3_THINKING_BUDGET_PROCESSOR,
+        thinking_budget_processor=thinking_processor,
     )
 
 
@@ -413,12 +453,32 @@ def _result_matches_item(item: ScheduleItem, result: Mapping[str, Any]) -> None:
     expected = {
         "benchmark": item.benchmark,
         "problem_id": item.problem_id,
-        "condition": item.condition.value,
         "seed": item.seed,
     }
+    if item.condition is not None:
+        expected["condition"] = item.condition.value
+    else:
+        condition = request.get("condition")
+        if condition is not None:
+            raise ArtifactMismatchError(
+                f"solver result condition mismatch for {item.run_id}: {condition!r}"
+            )
+    if item.harness_id is not None:
+        expected["harness_id"] = item.harness_id
     for key, value in expected.items():
         if request.get(key) != value:
             raise ArtifactMismatchError(f"solver result {key} mismatch for {item.run_id}")
+    if item.harness_id is not None:
+        metadata = request.get("metadata")
+        if not isinstance(metadata, Mapping):
+            raise ArtifactMismatchError(
+                f"solver result lacks harness metadata for {item.run_id}"
+            )
+        for key, value in _harness_identity(item).items():
+            if result.get(key) != value or metadata.get(key) != value:
+                raise ArtifactMismatchError(
+                    f"solver result {key} mismatch for {item.run_id}"
+                )
 
 
 async def _solve_one(
@@ -432,6 +492,19 @@ async def _solve_one(
     prompts: QEDPromptSet,
 ) -> str:
     identity = _schedule_identity(item, stage="solve")
+    harness = None
+    if item.harness_entrypoint is not None:
+        harness = load_harness(
+            item.harness_entrypoint,
+            source_sha256=item.harness_source_sha256,
+        )
+        if (
+            harness.spec.harness_id != item.harness_id
+            or harness.spec.access != item.harness_access
+        ):
+            raise ArtifactMismatchError(
+                f"loaded harness identity does not match schedule item {item.run_id}"
+            )
     retries = context.config.runtime.max_retries
     for retry in range(retries + 1):
         try:
@@ -458,13 +531,17 @@ async def _solve_one(
 
         orchestrator = AletheiaOrchestrator(
             client,
-            _orchestrator_config(context.config),
+            _orchestrator_config(context.config, token_counter=token_counter),
             checkpoint=checkpoint,
             request_lifecycle=handle,
             token_counter=token_counter,
         )
         try:
-            result = await orchestrator.run(request, resume=claim.checkpoint)
+            result = await orchestrator.run(
+                request,
+                resume=claim.checkpoint,
+                harness=harness,
+            )
         except asyncio.CancelledError:
             handle.close()
             raise
@@ -506,6 +583,7 @@ async def _solve_one(
                 "ordinal": item.ordinal,
                 "problem_fingerprint": item.problem_fingerprint,
                 "usage_exact": True,
+                **_harness_identity(item),
             }
         )
         return result.status.value
@@ -608,7 +686,7 @@ def _judge_base_record(item: ScheduleItem, solve_result: Mapping[str, Any]) -> d
         "benchmark": item.benchmark,
         "item_id": item.problem_id,
         "problem_id": item.problem_id,
-        "condition": item.condition.value,
+        "condition": _method_id(item),
         "seed": item.seed,
         "ordinal": item.ordinal,
         "problem_fingerprint": item.problem_fingerprint,
@@ -619,6 +697,7 @@ def _judge_base_record(item: ScheduleItem, solve_result: Mapping[str, Any]) -> d
         "solution_sha256": hashlib.sha256(
             str(solve_result.get("final_output") or "").encode("utf-8")
         ).hexdigest(),
+        **_harness_identity(item),
     }
 
 
@@ -871,25 +950,27 @@ def _smoke_cells(
     benchmark: str,
     seed: int,
     problem_id: str | None,
+    required: Sequence[str],
 ) -> tuple[ScheduleItem, ...]:
-    required = tuple(Condition)
+    required = tuple(required)
     problem_order: list[str] = []
-    by_problem: dict[str, dict[Condition, ScheduleItem]] = {}
+    by_problem: dict[str, dict[str, ScheduleItem]] = {}
     for item in schedule:
         if item.benchmark != benchmark or item.seed != seed or not item.reference_proof:
             continue
         if item.problem_id not in by_problem:
             problem_order.append(item.problem_id)
             by_problem[item.problem_id] = {}
-        by_problem[item.problem_id][item.condition] = item
+        by_problem[item.problem_id][_method_id(item)] = item
     selected_problem_ids = [problem_id] if problem_id is not None else problem_order
     for selected_problem_id in selected_problem_ids:
         cells = by_problem.get(selected_problem_id, {})
-        if all(condition in cells for condition in required):
-            return tuple(cells[condition] for condition in required)
+        if all(method in cells for method in required):
+            return tuple(cells[method] for method in required)
     qualifier = f" problem {problem_id!r}" if problem_id is not None else ""
     raise ValueError(
-        f"no reference-bearing {benchmark}{qualifier} has all four conditions at seed {seed}"
+        f"no reference-bearing {benchmark}{qualifier} has all configured harnesses "
+        f"at seed {seed}"
     )
 
 
@@ -906,15 +987,19 @@ async def smoke(
     prompts: QEDPromptSet | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Opt-in live check of one proof problem across all four conditions."""
+    """Opt-in live check of one proof problem across the configured conditions."""
 
     context = _context(source)
     schedule = _load_schedule(context)
+    configured_methods = tuple(
+        dict.fromkeys(_method_id(item) for item in schedule if item.benchmark == benchmark)
+    )
     cells = _smoke_cells(
         schedule,
         benchmark=benchmark,
         seed=seed,
         problem_id=problem_id,
+        required=configured_methods,
     )
     run_ids = tuple(item.run_id for item in cells)
     prompt_set = prompts or QEDPromptSet()
@@ -953,7 +1038,7 @@ async def smoke(
         if solve_status not in ADJUDICATABLE_TRAJECTORY_STATUSES or judge_status != "completed":
             failures.append(
                 {
-                    "condition": item.condition.value,
+                    "condition": _method_id(item),
                     "solve_status": solve_status,
                     "judge_status": judge_status,
                 }
@@ -964,7 +1049,7 @@ async def smoke(
         "benchmark": benchmark,
         "problem_id": cells[0].problem_id,
         "seed": seed,
-        "conditions": [item.condition.value for item in cells],
+        "conditions": [_method_id(item) for item in cells],
         "run_ids": list(run_ids),
         "solve": solved,
         "judge": judged,
@@ -1035,7 +1120,7 @@ def joined_rows(source: StageSource) -> list[dict[str, Any]]:
             "benchmark": item.benchmark,
             "item_id": item.problem_id,
             "problem_id": item.problem_id,
-            "condition": item.condition.value,
+            "condition": _method_id(item),
             "seed": item.seed,
             "ordinal": item.ordinal,
             "applicable": True,
@@ -1044,17 +1129,52 @@ def joined_rows(source: StageSource) -> list[dict[str, Any]]:
             "generated_tokens": 0,
             "total_tokens": 0,
             "usage_exact": False,
+            "value_query_count": 0,
+            "value_estimates": [],
+            "verifier_assessments": [],
+            "generated_tokens_by_role": {},
+            **_harness_identity(item),
         }
         solve_result = solve_store.load_result(item.run_id)
         if solve_result is not None:
             _result_matches_item(item, solve_result)
             usage = solve_result.get("usage")
             normalized_usage = dict(usage) if isinstance(usage, Mapping) else {}
+            raw_estimates = solve_result.get("value_estimates", [])
+            value_estimates = (
+                [dict(value) for value in raw_estimates if isinstance(value, Mapping)]
+                if isinstance(raw_estimates, Sequence)
+                and not isinstance(raw_estimates, (str, bytes))
+                else []
+            )
+            raw_verdicts = solve_result.get("verdicts", [])
+            verifier_assessments = (
+                [dict(value) for value in raw_verdicts if isinstance(value, Mapping)]
+                if isinstance(raw_verdicts, Sequence)
+                and not isinstance(raw_verdicts, (str, bytes))
+                else []
+            )
+            generated_by_role: Counter[str] = Counter()
+            raw_calls = solve_result.get("calls", [])
+            if isinstance(raw_calls, Sequence) and not isinstance(raw_calls, (str, bytes)):
+                for call in raw_calls:
+                    if not isinstance(call, Mapping):
+                        continue
+                    call_usage = call.get("usage")
+                    if not isinstance(call_usage, Mapping):
+                        continue
+                    generated_by_role[str(call.get("role", "unknown"))] += int(
+                        call_usage.get("completion_tokens", 0)
+                    )
             row.update(
                 solve_status=str(solve_result.get("status", "failed")),
                 generated_tokens=int(normalized_usage.get("completion_tokens", 0)),
                 total_tokens=int(normalized_usage.get("total_tokens", 0)),
                 usage_exact=bool(solve_result.get("usage_exact", True)),
+                value_query_count=len(value_estimates),
+                value_estimates=value_estimates,
+                verifier_assessments=verifier_assessments,
+                generated_tokens_by_role=dict(sorted(generated_by_role.items())),
             )
         judge_result = judge_store.load_result(item.run_id)
         if judge_result is not None:

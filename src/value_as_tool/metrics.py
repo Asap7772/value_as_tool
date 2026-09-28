@@ -16,8 +16,16 @@ from .schemas import ADJUDICATABLE_TRAJECTORY_STATUSES
 
 DEFAULT_COMPARISONS: tuple[tuple[str, str], ...] = (
     ("gvr", "direct"),
-    ("gvr_subagents", "gvr"),
-    ("gvr_reference", "gvr"),
+    ("gvr_subagents", "direct"),
+    ("gvr_reference", "direct"),
+    ("value_tool", "direct"),
+    ("gvr_rationale_score", "direct"),
+    ("value_tool_rationale_score", "direct"),
+    ("gvr_reference_rationale_score", "direct"),
+    ("cch_plan_work_review", "direct"),
+    ("gvr_rationale_score", "gvr"),
+    ("value_tool_rationale_score", "value_tool"),
+    ("gvr_reference_rationale_score", "gvr_reference"),
 )
 PROOF_BENCHMARKS = {
     "imo_proof",
@@ -27,6 +35,10 @@ PROOF_BENCHMARKS = {
     "lm-provers/imoproofbench",
     "lm-provers/proofbench",
 }
+LEGACY_REFERENCE_METHODS = frozenset(
+    {"gvr_reference", "gvr_reference_rationale_score"}
+)
+HARNESS_ACCESS_CLASSES = frozenset({"blind", "reference_assisted"})
 
 
 def _plain(value: Any) -> Any:
@@ -53,6 +65,125 @@ def _field(row: Mapping[str, Any], name: str, default: Any = None) -> Any:
     if name == "item_id" and "problem_id" in row:
         return _plain(row["problem_id"])
     return default
+
+
+def _identity_field(row: Mapping[str, Any], name: str, default: Any = None) -> Any:
+    """Read one consistent harness-identity value from all persisted locations.
+
+    Final pipeline rows put harness identity at the top level, while raw
+    trajectory artifacts retain part of it on the request and the rest in
+    request metadata.  Accept both shapes, but never let a stale top-level
+    value silently mask conflicting source-version metadata.
+    """
+
+    candidates: list[tuple[str, Any]] = []
+    if name in row and row[name] is not None:
+        candidates.append(("row", _plain(row[name])))
+    request = _nested_mapping(row, "request")
+    if name in request and request[name] is not None:
+        candidates.append(("request", _plain(request[name])))
+    metadata = _nested_mapping(request, "metadata")
+    if name in metadata and metadata[name] is not None:
+        candidates.append(("request.metadata", _plain(metadata[name])))
+    if not candidates:
+        return default
+    value = candidates[0][1]
+    conflicts = [location for location, candidate in candidates[1:] if candidate != value]
+    if conflicts:
+        locations = ", ".join([candidates[0][0], *conflicts])
+        raise ValueError(f"inconsistent {name} across {locations}")
+    return value
+
+
+def _method_identity(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return one source-versioned method identity with a legacy fallback."""
+
+    harness_id_value = _identity_field(row, "harness_id")
+    condition_value = _field(row, "condition")
+    if harness_id_value is None:
+        if condition_value is None or not str(condition_value):
+            raise ValueError("each metric row requires a harness_id or condition")
+        method_id = str(condition_value)
+        identity = {
+            "method_id": method_id,
+            "condition": method_id,
+            "harness_id": None,
+            "harness_entrypoint": None,
+            "harness_source_sha256": None,
+            "harness_access": (
+                "reference_assisted"
+                if method_id in LEGACY_REFERENCE_METHODS
+                else "blind"
+            ),
+        }
+        _validate_reported_method_id(row, method_id)
+        return identity
+
+    method_id = str(harness_id_value)
+    source_value = _identity_field(row, "harness_source_sha256")
+    access_value = _identity_field(row, "harness_access")
+    entrypoint_value = _identity_field(row, "harness_entrypoint")
+    if not method_id:
+        raise ValueError("harness_id must not be empty")
+    source_sha256 = str(source_value or "")
+    if len(source_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in source_sha256
+    ):
+        raise ValueError("harness_source_sha256 must be a lowercase SHA-256 digest")
+    access = str(access_value or "")
+    if access not in HARNESS_ACCESS_CLASSES:
+        raise ValueError(
+            "harness_access must be 'blind' or 'reference_assisted'"
+        )
+    entrypoint = str(entrypoint_value or "")
+    if not entrypoint:
+        raise ValueError("harness_entrypoint must not be empty")
+    identity = {
+        "method_id": method_id,
+        # Keep the historical field populated so downstream CSV consumers do
+        # not need a flag day.  It is now a method ID, not necessarily a
+        # schemas.Condition value.
+        "condition": method_id,
+        "harness_id": method_id,
+        "harness_entrypoint": entrypoint,
+        "harness_source_sha256": source_sha256,
+        "harness_access": access,
+    }
+    _validate_reported_method_id(row, method_id)
+    return identity
+
+
+def _validate_reported_method_id(row: Mapping[str, Any], resolved: str) -> None:
+    """Reject a denormalized method label that disagrees with its identity."""
+
+    reported = row.get("method_id")
+    if reported is not None and str(_plain(reported)) != resolved:
+        raise ValueError(
+            f"method_id {reported!r} does not match resolved method identity {resolved!r}"
+        )
+
+
+def _method_key(row: Mapping[str, Any]) -> tuple[str, str]:
+    identity = _method_identity(row)
+    return (
+        str(identity["method_id"]),
+        str(identity["harness_source_sha256"] or ""),
+    )
+
+
+def _method_output_fields(row: Mapping[str, Any]) -> dict[str, Any]:
+    identity = _method_identity(row)
+    return {
+        key: identity[key]
+        for key in (
+            "method_id",
+            "condition",
+            "harness_id",
+            "harness_entrypoint",
+            "harness_source_sha256",
+            "harness_access",
+        )
+    }
 
 
 def _is_proof(benchmark: str) -> bool:
@@ -333,34 +464,52 @@ def _normalize_rows(
 ) -> list[dict[str, Any]]:
     """Reject duplicates and materialize inferable missing scheduled cells."""
 
-    supplied: dict[tuple[str, str, str, int], dict[str, Any]] = {}
+    supplied: dict[tuple[str, str, str, str, int], dict[str, Any]] = {}
     by_benchmark_items: dict[str, set[str]] = defaultdict(set)
     by_benchmark_seeds: dict[str, set[int]] = defaultdict(set)
-    by_benchmark_conditions: dict[str, set[str]] = defaultdict(set)
+    by_benchmark_item_methods: dict[
+        str, dict[str, set[tuple[str, str]]]
+    ] = defaultdict(lambda: defaultdict(set))
+    method_identities: dict[tuple[str, str], dict[str, Any]] = {}
     for original in rows:
         if not _is_applicable(original):
             continue
         row = dict(original)
         benchmark = str(_field(row, "benchmark", ""))
         item_id = str(_field(row, "item_id", ""))
-        condition = str(_field(row, "condition", ""))
+        method_identity = _method_identity(row)
+        method_id = str(method_identity["method_id"])
+        source_sha256 = str(method_identity["harness_source_sha256"] or "")
+        method_key = method_id, source_sha256
         seed_value = _field(row, "seed", 0)
-        if not benchmark or not item_id or not condition:
-            raise ValueError("each metric row requires benchmark, item_id, and condition")
+        if not benchmark or not item_id:
+            raise ValueError("each metric row requires benchmark and item_id")
         if isinstance(seed_value, bool):
             raise ValueError("seed must be an integer")
         try:
             seed = int(seed_value)
         except (TypeError, ValueError) as exc:
             raise ValueError("seed must be an integer") from exc
-        key = benchmark, item_id, condition, seed
+        key = benchmark, item_id, method_id, source_sha256, seed
         if key in supplied:
             raise ValueError(f"duplicate scheduled cell: {key}")
-        row.update(benchmark=benchmark, item_id=item_id, condition=condition, seed=seed)
+        previous_identity = method_identities.get(method_key)
+        if previous_identity is not None and previous_identity != method_identity:
+            raise ValueError(
+                f"inconsistent harness metadata for method {method_id!r} at "
+                f"source {source_sha256 or 'legacy'}"
+            )
+        method_identities[method_key] = method_identity
+        row.update(
+            benchmark=benchmark,
+            item_id=item_id,
+            seed=seed,
+            **method_identity,
+        )
         supplied[key] = row
         by_benchmark_items[benchmark].add(item_id)
         by_benchmark_seeds[benchmark].add(seed)
-        by_benchmark_conditions[benchmark].add(condition)
+        by_benchmark_item_methods[benchmark][item_id].add(method_key)
 
     output: list[dict[str, Any]] = []
     for benchmark in sorted(by_benchmark_items):
@@ -378,19 +527,24 @@ def _normalize_rows(
         if not seeds:
             raise ValueError("expected_seeds must not be empty")
         for item_id in sorted(by_benchmark_items[benchmark]):
-            for condition in sorted(by_benchmark_conditions[benchmark]):
+            # Only fill missing seeds for a method/problem pair that is known
+            # to be scheduled.  A reference-assisted harness may legitimately
+            # be absent for a problem with no reference proof.
+            for method_key in sorted(by_benchmark_item_methods[benchmark][item_id]):
+                method_id, source_sha256 = method_key
+                method_identity = method_identities[method_key]
                 for seed in seeds:
-                    key = benchmark, item_id, condition, seed
+                    key = benchmark, item_id, method_id, source_sha256, seed
                     output.append(
                         supplied.get(
                             key,
                             {
                                 "benchmark": benchmark,
                                 "item_id": item_id,
-                                "condition": condition,
                                 "seed": seed,
                                 "judge_status": "missing",
                                 "_inferred_missing": True,
+                                **method_identity,
                             },
                         )
                     )
@@ -399,10 +553,11 @@ def _normalize_rows(
 
 def _group_rows(
     rows: Iterable[Mapping[str, Any]],
-) -> dict[tuple[str, str], list[Mapping[str, Any]]]:
-    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
+) -> dict[tuple[str, str, str], list[Mapping[str, Any]]]:
+    grouped: dict[tuple[str, str, str], list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
-        grouped[(str(row["benchmark"]), str(row["condition"]))].append(row)
+        method_id, source_sha256 = _method_key(row)
+        grouped[(str(row["benchmark"]), method_id, source_sha256)].append(row)
     return grouped
 
 
@@ -413,13 +568,25 @@ def summarize_metrics(
 ) -> list[dict[str, Any]]:
     normalized = _normalize_rows(rows, expected_seeds=expected_seeds)
     summaries: list[dict[str, Any]] = []
-    for (benchmark, condition), group in sorted(_group_rows(normalized).items()):
+    for (benchmark, _method_id, _source_sha256), group in sorted(
+        _group_rows(normalized).items()
+    ):
         proof = _is_proof(benchmark)
         rewards = [_score(row, proof=proof) for row in group]
         successes = [reward == (7 if proof else 1) for reward in rewards]
         generated = [_token_cost(row)[0] for row in group]
         totals = [_token_cost(row)[1] for row in group]
         exact = [_token_cost(row)[2] for row in group]
+        value_queries = [int(row.get("value_query_count", 0) or 0) for row in group]
+        value_verifier_tokens = [
+            int(
+                _nested_mapping(row, "generated_tokens_by_role").get(
+                    "value_verifier", 0
+                )
+                or 0
+            )
+            for row in group
+        ]
         by_seed: dict[int, list[float]] = defaultdict(list)
         for row, reward in zip(group, rewards, strict=True):
             by_seed[int(row["seed"])].append(reward)
@@ -432,7 +599,7 @@ def summarize_metrics(
         )
         summary: dict[str, Any] = {
             "benchmark": benchmark,
-            "condition": condition,
+            **_method_output_fields(group[0]),
             "kind": "proof" if proof else "answer",
             "problems": len({str(row["item_id"]) for row in group}),
             "evaluation_runs": len(by_seed),
@@ -447,6 +614,9 @@ def summarize_metrics(
             "raw_success_rate": float(np.mean(successes)) if successes else None,
             "generated_tokens": int(sum(generated)),
             "total_tokens": int(sum(totals)),
+            "value_queries": int(sum(value_queries)),
+            "value_queries_per_trajectory": float(np.mean(value_queries)),
+            "value_verifier_generated_tokens": int(sum(value_verifier_tokens)),
             "generated_tokens_per_trajectory": (
                 float(np.mean(generated)) if generated else None
             ),
@@ -496,7 +666,9 @@ def compute_curves(
 ) -> list[dict[str, Any]]:
     normalized = _normalize_rows(rows, expected_seeds=expected_seeds)
     curves: list[dict[str, Any]] = []
-    for (benchmark, condition), group in sorted(_group_rows(normalized).items()):
+    for (benchmark, _method_id, _source_sha256), group in sorted(
+        _group_rows(normalized).items()
+    ):
         proof = _is_proof(benchmark)
         problems = _per_problem(group)
         for k in ks:
@@ -538,7 +710,7 @@ def compute_curves(
             curves.append(
                 {
                     "benchmark": benchmark,
-                    "condition": condition,
+                    **_method_output_fields(group[0]),
                     "kind": "proof" if proof else "answer",
                     "k": int(k),
                     "problems": len(pass_values),
@@ -576,7 +748,9 @@ def compatibility_metrics(
 
     normalized = _normalize_rows(rows, expected_seeds=expected_seeds)
     output: list[dict[str, Any]] = []
-    for (benchmark, condition), group in sorted(_group_rows(normalized).items()):
+    for (benchmark, _method_id, _source_sha256), group in sorted(
+        _group_rows(normalized).items()
+    ):
         proof = _is_proof(benchmark)
         if proof:
             seed_values: dict[int, list[float]] = defaultdict(list)
@@ -586,7 +760,7 @@ def compatibility_metrics(
             output.append(
                 {
                     "benchmark": benchmark,
-                    "condition": condition,
+                    **_method_output_fields(group[0]),
                     "metric": f"normalized_avg@{len(means)}",
                     "value": float(np.mean(means) / 7) if means else None,
                     "percent": float(np.mean(means) * 100 / 7) if means else None,
@@ -598,7 +772,7 @@ def compatibility_metrics(
             output.append(
                 {
                     "benchmark": benchmark,
-                    "condition": condition,
+                    **_method_output_fields(group[0]),
                     "metric": f"accuracy_seed_{answer_seed}",
                     "value": float(np.mean(values)) if values else None,
                     "percent": float(np.mean(values) * 100) if values else None,
@@ -655,67 +829,103 @@ def paired_bootstrap(
     if samples <= 0:
         raise ValueError("bootstrap samples must be positive")
     normalized = _normalize_rows(rows, expected_seeds=expected_seeds)
-    by_benchmark: dict[str, dict[str, dict[str, list[Mapping[str, Any]]]]] = defaultdict(
-        lambda: defaultdict(lambda: defaultdict(list))
-    )
+    by_benchmark: dict[
+        str,
+        dict[tuple[str, str], dict[str, list[Mapping[str, Any]]]],
+    ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for row in normalized:
-        by_benchmark[str(row["benchmark"])][str(row["condition"])][
-            str(row["item_id"])
-        ].append(row)
+        by_benchmark[str(row["benchmark"])][_method_key(row)][str(row["item_id"])].append(
+            row
+        )
 
     output: list[dict[str, Any]] = []
-    for benchmark, conditions in sorted(by_benchmark.items()):
+    for benchmark, methods in sorted(by_benchmark.items()):
         proof = _is_proof(benchmark)
         for treatment, baseline in comparisons:
-            if treatment not in conditions or baseline not in conditions:
+            treatment_keys = sorted(
+                key for key in methods if key[0] == treatment
+            )
+            baseline_keys = sorted(key for key in methods if key[0] == baseline)
+            if not treatment_keys or not baseline_keys:
                 continue  # An absent condition is N/A, not a zero-valued arm.
-            item_ids = sorted(set(conditions[treatment]) | set(conditions[baseline]))
-            metric_deltas: dict[str, list[float]] = defaultdict(list)
-            for item_id in item_ids:
-                treatment_rows = sorted(
-                    conditions[treatment].get(item_id, []), key=lambda row: int(row["seed"])
-                )
-                baseline_rows = sorted(
-                    conditions[baseline].get(item_id, []), key=lambda row: int(row["seed"])
-                )
-                if not treatment_rows or not baseline_rows:
-                    # _normalize_rows normally prevents this; retain explicit
-                    # zero stubs for callers that pass a partial custom grid.
-                    continue
-                treatment_values = _problem_metric_values(
-                    treatment_rows, proof=proof, ks=ks
-                )
-                baseline_values = _problem_metric_values(baseline_rows, proof=proof, ks=ks)
-                for metric in sorted(set(treatment_values) & set(baseline_values)):
-                    metric_deltas[metric].append(
-                        treatment_values[metric] - baseline_values[metric]
+            # Preserve source isolation.  If a caller deliberately combines
+            # multiple source revisions, report every explicit version pair
+            # instead of silently pooling them under a shared harness ID.
+            for treatment_key, baseline_key in itertools.product(
+                treatment_keys, baseline_keys
+            ):
+                treatment_groups = methods[treatment_key]
+                baseline_groups = methods[baseline_key]
+                item_ids = sorted(set(treatment_groups) | set(baseline_groups))
+                metric_deltas: dict[str, list[float]] = defaultdict(list)
+                for item_id in item_ids:
+                    treatment_rows = sorted(
+                        treatment_groups.get(item_id, []),
+                        key=lambda row: int(row["seed"]),
                     )
-            for metric, deltas_list in sorted(metric_deltas.items()):
-                deltas = np.asarray(deltas_list, dtype=float)
-                if not len(deltas):
-                    continue
-                # A group-derived seed keeps every interval reproducible even
-                # if reporting order or an unrelated comparison later changes.
-                salt = f"{seed}:{benchmark}:{treatment}:{baseline}:{metric}"
-                group_seed = int.from_bytes(
-                    hashlib.sha256(salt.encode("utf-8")).digest()[:8], "big"
+                    baseline_rows = sorted(
+                        baseline_groups.get(item_id, []),
+                        key=lambda row: int(row["seed"]),
+                    )
+                    if not treatment_rows or not baseline_rows:
+                        continue
+                    treatment_values = _problem_metric_values(
+                        treatment_rows, proof=proof, ks=ks
+                    )
+                    baseline_values = _problem_metric_values(
+                        baseline_rows, proof=proof, ks=ks
+                    )
+                    for metric in sorted(
+                        set(treatment_values) & set(baseline_values)
+                    ):
+                        metric_deltas[metric].append(
+                            treatment_values[metric] - baseline_values[metric]
+                        )
+                treatment_identity = _method_output_fields(
+                    next(iter(next(iter(treatment_groups.values()))))
                 )
-                rng = np.random.default_rng(group_seed)
-                draw_indices = rng.integers(0, len(deltas), size=(samples, len(deltas)))
-                draws = deltas[draw_indices].mean(axis=1)
-                output.append(
-                    {
-                        "benchmark": benchmark,
-                        "condition": treatment,
-                        "baseline": baseline,
-                        "metric": metric,
-                        "paired_n": len(deltas),
-                        "bootstrap_samples": samples,
-                        "mean_delta": float(deltas.mean()),
-                        "ci95_low": float(np.quantile(draws, 0.025)),
-                        "ci95_high": float(np.quantile(draws, 0.975)),
-                    }
+                baseline_identity = _method_output_fields(
+                    next(iter(next(iter(baseline_groups.values()))))
                 )
+                for metric, deltas_list in sorted(metric_deltas.items()):
+                    deltas = np.asarray(deltas_list, dtype=float)
+                    if not len(deltas):
+                        continue
+                    salt = (
+                        f"{seed}:{benchmark}:{treatment_key[0]}:{treatment_key[1]}:"
+                        f"{baseline_key[0]}:{baseline_key[1]}:{metric}"
+                    )
+                    group_seed = int.from_bytes(
+                        hashlib.sha256(salt.encode("utf-8")).digest()[:8], "big"
+                    )
+                    rng = np.random.default_rng(group_seed)
+                    draw_indices = rng.integers(
+                        0, len(deltas), size=(samples, len(deltas))
+                    )
+                    draws = deltas[draw_indices].mean(axis=1)
+                    output.append(
+                        {
+                            "benchmark": benchmark,
+                            **treatment_identity,
+                            "baseline": baseline_identity["method_id"],
+                            "baseline_harness_id": baseline_identity["harness_id"],
+                            "baseline_harness_entrypoint": baseline_identity[
+                                "harness_entrypoint"
+                            ],
+                            "baseline_harness_source_sha256": baseline_identity[
+                                "harness_source_sha256"
+                            ],
+                            "baseline_harness_access": baseline_identity[
+                                "harness_access"
+                            ],
+                            "metric": metric,
+                            "paired_n": len(deltas),
+                            "bootstrap_samples": samples,
+                            "mean_delta": float(deltas.mean()),
+                            "ci95_low": float(np.quantile(draws, 0.025)),
+                            "ci95_high": float(np.quantile(draws, 0.975)),
+                        }
+                    )
     return output
 
 
@@ -769,6 +979,11 @@ def compute_metrics(
                 "paired over problem IDs; matched seeds are collapsed within each problem"
             ),
             "absent_condition": "N/A; no synthetic rows or zero score",
+            "method_identity": (
+                "harness rows are grouped by harness_id and harness_source_sha256; "
+                "legacy rows fall back to condition"
+            ),
+            "access_class": "blind and reference_assisted methods remain explicitly labeled",
         },
     }
 

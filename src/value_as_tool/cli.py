@@ -12,6 +12,12 @@ from typing import Any
 from dotenv import load_dotenv
 
 from .config import parse_overrides
+from .harnesses import (
+    BUILTIN_HARNESSES,
+    builtin_entrypoint_for_condition,
+    load_harness,
+    resolve_harness,
+)
 from .pipeline import (
     judge,
     load_context,
@@ -77,7 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("status", help="summarize solve and judge artifact states")
 
     smoke_parser = commands.add_parser(
-        "smoke", help="run one reference-bearing proof through all four arms and judge it"
+        "smoke",
+        help="run one reference-bearing proof through every selected method and judge it",
     )
     smoke_parser.add_argument(
         "--benchmark", choices=("imo_proof", "proofbench"), default="imo_proof"
@@ -94,12 +101,76 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="append one backend-specific server argument; may be repeated",
     )
+    harness_parser = commands.add_parser(
+        "harness", help="inspect and validate proof-harness modules"
+    )
+    harness_commands = harness_parser.add_subparsers(
+        dest="harness_command", required=True
+    )
+    harness_commands.add_parser("list", help="list the built-in harness registry")
+    harness_validate = harness_commands.add_parser(
+        "validate",
+        help="import and validate harnesses (configured harnesses by default)",
+    )
+    harness_validate.add_argument(
+        "entrypoints",
+        nargs="*",
+        metavar="MODULE:CLASS",
+        help="explicit harness entrypoint; may be repeated",
+    )
     commands.add_parser("all", help="run prepare, solve, judge, and report in order")
     return parser
 
 
 def _print(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str))
+
+
+def _harness_record(entrypoint: str) -> dict[str, Any]:
+    spec = resolve_harness(entrypoint)
+    return {
+        "harness_id": spec.harness_id,
+        "display_name": spec.display_name,
+        "access": spec.access,
+        "requires_reference": spec.requires_reference,
+        "condition": spec.condition.value if spec.condition is not None else None,
+        "entrypoint": spec.entrypoint,
+        "source_sha256": spec.source_sha256,
+    }
+
+
+def _inspect_harnesses(
+    entrypoints: Sequence[str], *, instantiate: bool
+) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    seen_ids: dict[str, str] = {}
+    for entrypoint in entrypoints:
+        try:
+            record = _harness_record(entrypoint)
+            if instantiate:
+                load_harness(entrypoint, source_sha256=record["source_sha256"])
+            previous = seen_ids.get(record["harness_id"])
+            if previous is not None:
+                raise ValueError(
+                    f"duplicate harness id {record['harness_id']!r}: "
+                    f"{previous!r} and {entrypoint!r}"
+                )
+            seen_ids[record["harness_id"]] = entrypoint
+            records.append(record)
+        except Exception as exc:
+            errors.append(
+                {
+                    "entrypoint": entrypoint,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return {
+        "ok": not errors,
+        "count": len(records),
+        "harnesses": records,
+        "errors": errors,
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -113,6 +184,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         overrides = parse_overrides(args.overrides)
     except ValueError as exc:
         parser.error(str(exc))
+
+    if args.command == "harness" and args.harness_command == "list":
+        result = _inspect_harnesses(BUILTIN_HARNESSES, instantiate=False)
+        _print(result)
+        return 0 if result["ok"] else 1
+
+    if args.command == "harness" and args.harness_command == "validate":
+        entrypoints = tuple(args.entrypoints)
+        if not entrypoints:
+            context = load_context(config_path, overrides=overrides)
+            configured = context.config.evaluation.harnesses
+            entrypoints = (
+                tuple(configured)
+                if configured is not None
+                else tuple(
+                    builtin_entrypoint_for_condition(condition)
+                    for condition in context.config.evaluation.conditions
+                )
+            )
+        result = _inspect_harnesses(entrypoints, instantiate=True)
+        _print(result)
+        return 0 if result["ok"] else 1
+
     context = load_context(config_path, overrides=overrides)
 
     if args.command == "preflight":

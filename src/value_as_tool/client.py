@@ -53,6 +53,7 @@ class ChatClient(Protocol):
         reasoning_effort: str | None = None,
         tools: Sequence[Mapping[str, Any]] | None = None,
         tool_choice: str | Mapping[str, Any] | None = None,
+        parallel_tool_calls: bool = True,
         extra_body: Mapping[str, Any] | None = None,
     ) -> ChatCompletion: ...
 
@@ -115,6 +116,7 @@ class OpenAIChatClient:
         reasoning_effort: str | None = None,
         tools: Sequence[Mapping[str, Any]] | None = None,
         tool_choice: str | Mapping[str, Any] | None = None,
+        parallel_tool_calls: bool = True,
         extra_body: Mapping[str, Any] | None = None,
     ) -> ChatCompletion:
         if max_tokens <= 0:
@@ -145,7 +147,7 @@ class OpenAIChatClient:
         if tools:
             payload["tools"] = [dict(tool) for tool in tools]
             payload["tool_choice"] = tool_choice if tool_choice is not None else "auto"
-            payload["parallel_tool_calls"] = True
+            payload["parallel_tool_calls"] = parallel_tool_calls
         elif tool_choice is not None:
             raise ValueError("tool_choice was supplied without tools")
         if extra_body:

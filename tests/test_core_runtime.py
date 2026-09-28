@@ -14,9 +14,11 @@ from value_as_tool.budget import BudgetAccountingError, BudgetExhausted, TokenBu
 from value_as_tool.client import MissingUsageError, OpenAIChatClient, parse_chat_completion
 from value_as_tool.config import load_config
 from value_as_tool.orchestrator import (
+    GVR_FORCED_CANDIDATE_REMINDER,
     QWEN3_THINKING_BUDGET_PROCESSOR,
     QWEN35_THINK_TOKEN_IDS,
     SUBAGENT_SYSTEM_PROMPT,
+    VALUE_FORCED_FINAL_REMINDER,
     AletheiaOrchestrator,
     NonResumableTrajectoryError,
     OrchestratorConfig,
@@ -31,6 +33,7 @@ from value_as_tool.schemas import (
     TrajectoryRequest,
     TrajectoryResult,
     TrajectoryStatus,
+    ValueEstimateRecord,
     Verdict,
 )
 
@@ -97,6 +100,31 @@ def _verdict(
     )
 
 
+def _rationale_verdict(
+    outcome: str,
+    *,
+    probability: float = 0.5,
+    rationale: str = "The decisive step is sound, but one edge case remains.",
+    category: str = "logic",
+    excerpt: str = "",
+) -> ChatCompletion:
+    return _completion(
+        tool_calls=[
+            _tool_call(
+                "submit_verdict",
+                {
+                    "outcome": outcome,
+                    "success_probability": probability,
+                    "rationale": rationale,
+                    "fault_category": category,
+                    "candidate_excerpt": excerpt,
+                },
+                "verdict-call",
+            )
+        ]
+    )
+
+
 def _config(**overrides: Any) -> OrchestratorConfig:
     values: dict[str, Any] = {
         "model": "offline-qwen",
@@ -112,6 +140,9 @@ def _config(**overrides: Any) -> OrchestratorConfig:
         "max_subagents": 3,
         "final_candidate_reserve_tokens": 15,
         "max_tool_rounds_per_candidate": 4,
+        "value_tool_max_queries": 3,
+        "value_verifier_cap": 10,
+        "value_final_response_reserve_tokens": 15,
         "subagent_context_max_chars": 12,
     }
     values.update(overrides)
@@ -332,6 +363,39 @@ async def test_client_replays_tool_messages_and_requests_parallel_tool_calls() -
 
 
 @pytest.mark.asyncio
+async def test_client_can_disable_parallel_tool_calls() -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"finish_reason": "stop", "message": {"content": "done"}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+            },
+        )
+
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "single", "parameters": {"type": "object"}},
+        }
+    ]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport_client:
+        client = OpenAIChatClient("http://offline.invalid/v1", client=transport_client)
+        await client.complete(
+            [{"role": "user", "content": "go"}],
+            model="qwen",
+            max_tokens=9,
+            tools=tools,
+            parallel_tool_calls=False,
+        )
+
+    assert captured[0]["parallel_tool_calls"] is False
+
+
+@pytest.mark.asyncio
 async def test_parallel_budget_reservations_cannot_oversubscribe_global_limit() -> None:
     budget = TokenBudget(10)
     gate = asyncio.Event()
@@ -394,6 +458,410 @@ async def test_direct_run_preserves_reasoning_usage_and_exact_allowance() -> Non
 
 
 @pytest.mark.asyncio
+async def test_value_tool_allows_a_final_answer_without_querying() -> None:
+    client = ScriptedClient(_completion("A complete proof.", completion_tokens=7))
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.VALUE_TOOL)
+    )
+
+    assert result.status is TrajectoryStatus.COMPLETED
+    assert result.final_output == "A complete proof."
+    assert result.value_estimates == []
+    assert [call.role for call in result.calls] == [Role.VALUE_SOLVER]
+    _, kwargs = client.calls[0]
+    assert kwargs["parallel_tool_calls"] is False
+    assert kwargs["tools"][0]["function"]["name"] == "query_success_probability"
+    assert kwargs["max_tokens"] == 95
+
+
+@pytest.mark.asyncio
+async def test_value_tool_queries_actual_trace_and_returns_only_probability() -> None:
+    client = ScriptedClient(
+        _completion(
+            "visible partial work",
+            reasoning="private partial derivation",
+            # SGLang's Qwen3.5 parser uses this wrapper for an empty schema.
+            tool_calls=[
+                _tool_call(
+                    "query_success_probability",
+                    {"parameters": "{}"},
+                    "probability-query",
+                )
+            ],
+            completion_tokens=4,
+        ),
+        _completion(
+            reasoning="verifier reasoning that must not reach the solver",
+            tool_calls=[
+                _tool_call(
+                    "submit_probability",
+                    {"success_probability": 0.25},
+                    "probability-result",
+                )
+            ],
+            completion_tokens=3,
+        ),
+        _completion("A corrected final proof.", completion_tokens=5),
+    )
+    request = _request(Condition.VALUE_TOOL, reference="SECRET REFERENCE PROOF")
+
+    result = await AletheiaOrchestrator(client, _config()).run(request)
+
+    assert result.status is TrajectoryStatus.COMPLETED
+    assert result.final_output == "A corrected final proof."
+    assert [call.role for call in result.calls] == [
+        Role.VALUE_SOLVER,
+        Role.VALUE_VERIFIER,
+        Role.VALUE_SOLVER,
+    ]
+    assert result.usage.completion_tokens == 12
+    assert len(result.value_estimates) == 1
+    estimate = result.value_estimates[0]
+    assert estimate.query_index == 0
+    assert estimate.probability == 0.25
+    assert estimate.solver_call_index == 0
+    assert estimate.verifier_call_index == 1
+    assert estimate.tool_call_id == "probability-query"
+    assert len(estimate.trace_sha256) == 64
+
+    verifier_messages, verifier_kwargs = client.calls[1]
+    verifier_payload = json.loads(verifier_messages[1]["content"])
+    assert verifier_payload["original_task"] == request.solver_prompt
+    assert "private partial derivation" in verifier_payload["partial_reasoning_trace"]
+    assert "visible partial work" in verifier_payload["partial_reasoning_trace"]
+    assert "SECRET REFERENCE PROOF" not in verifier_messages[1]["content"]
+    assert verifier_kwargs["parallel_tool_calls"] is False
+    assert verifier_kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "submit_probability"},
+    }
+
+    continuation_messages, continuation_kwargs = client.calls[2]
+    assert continuation_messages[-1] == {
+        "role": "tool",
+        "tool_call_id": "probability-query",
+        "name": "query_success_probability",
+        "content": '{"success_probability":0.25}',
+    }
+    assert "verifier reasoning that must not reach the solver" not in json.dumps(
+        continuation_messages
+    )
+    assert continuation_kwargs["parallel_tool_calls"] is False
+
+
+@pytest.mark.asyncio
+async def test_value_tool_rationale_score_returns_only_explicit_summary() -> None:
+    client = ScriptedClient(
+        _completion(
+            "visible partial work",
+            reasoning="solver derivation",
+            tool_calls=[_tool_call("query_success_probability", {})],
+        ),
+        _completion(
+            reasoning="private verifier chain of thought",
+            tool_calls=[
+                _tool_call(
+                    "submit_probability",
+                    {
+                        "success_probability": 0.4,
+                        "rationale": "The main lemma is unproved.",
+                    },
+                )
+            ],
+        ),
+        _completion("A repaired final proof."),
+    )
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.VALUE_TOOL_RATIONALE_SCORE)
+    )
+
+    assert result.status is TrajectoryStatus.COMPLETED
+    assert result.value_estimates[0].probability == 0.4
+    assert result.value_estimates[0].rationale == "The main lemma is unproved."
+    continuation = client.calls[2][0]
+    payload = json.loads(continuation[-1]["content"])
+    assert payload == {
+        "rationale": "The main lemma is unproved.",
+        "success_probability": 0.4,
+    }
+    assert "private verifier chain of thought" not in json.dumps(continuation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probability", [True, -0.01, 1.01])
+async def test_value_tool_rejects_invalid_probabilities(probability: Any) -> None:
+    client = ScriptedClient(
+        _completion(tool_calls=[_tool_call("query_success_probability", {})]),
+        _completion(
+            tool_calls=[
+                _tool_call("submit_probability", {"success_probability": probability})
+            ]
+        ),
+    )
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.VALUE_TOOL)
+    )
+
+    assert result.status is TrajectoryStatus.PROTOCOL_ERROR
+    assert result.value_estimates == []
+    assert "finite number between zero and one" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_value_tool_removes_query_tool_after_configured_limit() -> None:
+    client = ScriptedClient(
+        _completion(tool_calls=[_tool_call("query_success_probability", {})]),
+        _completion(
+            tool_calls=[_tool_call("submit_probability", {"success_probability": 0.8})]
+        ),
+        _completion("Final after one query."),
+    )
+
+    result = await AletheiaOrchestrator(
+        client,
+        _config(value_tool_max_queries=1),
+    ).run(_request(Condition.VALUE_TOOL))
+
+    assert result.status is TrajectoryStatus.COMPLETED
+    assert len(result.value_estimates) == 1
+    assert client.calls[2][1]["tools"] is None
+
+
+@pytest.mark.asyncio
+async def test_value_tool_recovers_once_from_post_limit_pseudo_tool_markup() -> None:
+    pseudo_query = _completion(
+        "<tool_call>\n<function=query_success_probability>\n</function>\n</tool_call>"
+    )
+    client = ScriptedClient(
+        _completion(tool_calls=[_tool_call("query_success_probability", {})]),
+        _completion(
+            tool_calls=[_tool_call("submit_probability", {"success_probability": 0.7})]
+        ),
+        pseudo_query,
+        _completion("Actual final proof."),
+    )
+
+    result = await AletheiaOrchestrator(
+        client,
+        _config(value_tool_max_queries=1),
+    ).run(_request(Condition.VALUE_TOOL))
+
+    assert result.status is TrajectoryStatus.COMPLETED
+    assert result.final_output == "Actual final proof."
+    assert len(result.value_estimates) == 1
+    assert [call.role for call in result.calls] == [
+        Role.VALUE_SOLVER,
+        Role.VALUE_VERIFIER,
+        Role.VALUE_SOLVER,
+        Role.VALUE_SOLVER,
+    ]
+    assert client.calls[2][1]["tools"] is None
+    assert client.calls[3][1]["tools"] is None
+    assert client.calls[3][0][-2] == pseudo_query.message.to_api_dict()
+    assert client.calls[3][0][-1] == {
+        "role": "user",
+        "content": VALUE_FORCED_FINAL_REMINDER,
+    }
+    assert sum(
+        transition.action == "reject_pseudo_tool_call"
+        for transition in result.transitions
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_value_tool_repeated_post_limit_pseudo_tool_is_protocol_error() -> None:
+    pseudo_query = _completion(
+        '{"name":"query_success_probability","arguments":{}}'
+    )
+    client = ScriptedClient(
+        _completion(tool_calls=[_tool_call("query_success_probability", {})]),
+        _completion(
+            tool_calls=[_tool_call("submit_probability", {"success_probability": 0.7})]
+        ),
+        pseudo_query,
+        pseudo_query,
+    )
+
+    result = await AletheiaOrchestrator(
+        client,
+        _config(value_tool_max_queries=1),
+    ).run(_request(Condition.VALUE_TOOL))
+
+    assert result.status is TrajectoryStatus.PROTOCOL_ERROR
+    assert result.final_output is None
+    assert "repeated probability-query markup" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_value_tool_resume_after_pseudo_tool_only_dispatches_recovery() -> None:
+    query = _completion(tool_calls=[_tool_call("query_success_probability", {})])
+    probability = _completion(
+        tool_calls=[_tool_call("submit_probability", {"success_probability": 0.7})]
+    )
+    pseudo_query = _completion(
+        "<tool_call><function=query_success_probability></function></tool_call>"
+    )
+    final = _completion("Recovered final proof.")
+    snapshots: list[TrajectoryResult] = []
+
+    def checkpoint(result: TrajectoryResult) -> None:
+        snapshots.append(copy.deepcopy(result))
+
+    request = _request(Condition.VALUE_TOOL)
+    config = _config(value_tool_max_queries=1)
+    complete = await AletheiaOrchestrator(
+        ScriptedClient(query, probability, pseudo_query, final),
+        config,
+        checkpoint=checkpoint,
+    ).run(request)
+    after_pseudo = next(
+        snapshot
+        for snapshot in snapshots
+        if len(snapshot.calls) == 3
+        and snapshot.calls[-1].response is not None
+        and snapshot.calls[-1].response.message.content == pseudo_query.message.content
+    )
+    resumed_client = ScriptedClient(final)
+
+    resumed = await AletheiaOrchestrator(resumed_client, config).run(
+        request,
+        resume=after_pseudo,
+    )
+
+    assert resumed.to_dict() == complete.to_dict()
+    assert len(resumed_client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_value_tool_rejects_multiple_or_unknown_solver_tools() -> None:
+    client = ScriptedClient(
+        _completion(
+            tool_calls=[
+                _tool_call("query_success_probability", {}, "first"),
+                _tool_call("unknown", {}, "second"),
+            ]
+        )
+    )
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.VALUE_TOOL)
+    )
+
+    assert result.status is TrajectoryStatus.PROTOCOL_ERROR
+    assert len(result.calls) == 1
+    assert result.value_estimates == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"proof_status":"working on a lemma"}',
+        '{"parameters":"{}"}',
+        "not-json-from-provider-parser",
+    ],
+)
+async def test_value_tool_ignores_query_argument_payload(arguments: str) -> None:
+    client = ScriptedClient(
+        _completion(
+            tool_calls=[
+                ToolCall(
+                    id="ignored-arguments",
+                    name="query_success_probability",
+                    arguments=arguments,
+                )
+            ]
+        ),
+        _completion(
+            tool_calls=[_tool_call("submit_probability", {"success_probability": 0.4})]
+        ),
+        _completion("Final proof after ignored query arguments."),
+    )
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.VALUE_TOOL)
+    )
+
+    assert result.status is TrajectoryStatus.COMPLETED
+    assert result.value_estimates[0].probability == 0.4
+    verifier_payload = json.loads(client.calls[1][0][1]["content"])
+    assert set(verifier_payload) == {"original_task", "partial_reasoning_trace"}
+    assert "proof_status" not in verifier_payload["partial_reasoning_trace"]
+
+
+@pytest.mark.asyncio
+async def test_value_tool_resume_replays_solver_and_verifier_boundaries() -> None:
+    query = _completion(
+        reasoning="partial proof",
+        tool_calls=[_tool_call("query_success_probability", {}, "resume-query")],
+        completion_tokens=4,
+    )
+    probability = _completion(
+        tool_calls=[_tool_call("submit_probability", {"success_probability": 0.6})],
+        completion_tokens=3,
+    )
+    final = _completion("Resumed final proof.", completion_tokens=5)
+    snapshots: list[TrajectoryResult] = []
+
+    def checkpoint(result: TrajectoryResult) -> None:
+        snapshots.append(copy.deepcopy(result))
+
+    request = _request(Condition.VALUE_TOOL)
+    complete = await AletheiaOrchestrator(
+        ScriptedClient(query, probability, final),
+        _config(),
+        checkpoint=checkpoint,
+    ).run(request)
+    after_solver = next(
+        snapshot
+        for snapshot in snapshots
+        if [call.role for call in snapshot.calls] == [Role.VALUE_SOLVER]
+    )
+    after_verifier = next(
+        snapshot
+        for snapshot in snapshots
+        if [call.role for call in snapshot.calls]
+        == [Role.VALUE_SOLVER, Role.VALUE_VERIFIER]
+        and not snapshot.value_estimates
+    )
+
+    resumed_from_solver = await AletheiaOrchestrator(
+        ScriptedClient(probability, final),
+        _config(),
+    ).run(request, resume=after_solver)
+    resumed_from_verifier = await AletheiaOrchestrator(
+        ScriptedClient(final),
+        _config(),
+    ).run(request, resume=after_verifier)
+
+    assert resumed_from_solver.to_dict() == complete.to_dict()
+    assert resumed_from_verifier.to_dict() == complete.to_dict()
+
+
+def test_value_estimate_artifact_validation_is_strict() -> None:
+    value = {
+        "query_index": 0,
+        "probability": 0.5,
+        "solver_call_index": 0,
+        "verifier_call_index": 1,
+        "tool_call_id": "query",
+        "trace_sha256": "a" * 64,
+    }
+    assert ValueEstimateRecord.from_dict(value).to_dict() == value
+
+    for invalid_probability in (True, float("nan"), -0.1, 1.1):
+        with pytest.raises(ValueError, match="probability"):
+            ValueEstimateRecord.from_dict({**value, "probability": invalid_probability})
+    with pytest.raises(ValueError, match="SHA-256"):
+        ValueEstimateRecord.from_dict({**value, "trace_sha256": "not-a-digest"})
+    with pytest.raises(ValueError, match="unexpected fields"):
+        ValueEstimateRecord.from_dict({**value, "critique": "must not be persisted"})
+
+
+@pytest.mark.asyncio
 async def test_direct_length_finish_is_exhausted_and_resumes_without_repeating() -> None:
     snapshots: list[TrajectoryResult] = []
     client = ScriptedClient(
@@ -427,6 +895,70 @@ async def test_direct_length_finish_is_exhausted_and_resumes_without_repeating()
 
 
 @pytest.mark.asyncio
+async def test_direct_recovers_empty_output_once_without_thinking_and_resumes() -> None:
+    empty = _completion(
+        None,
+        reasoning="Private reasoning without a visible answer.",
+        completion_tokens=2,
+    )
+    recovered = _completion("Recovered direct proof.", completion_tokens=3)
+    snapshots: list[TrajectoryResult] = []
+    request = _request(Condition.DIRECT)
+    config = _config()
+    client = ScriptedClient(empty, recovered)
+
+    complete = await AletheiaOrchestrator(
+        client,
+        config,
+        checkpoint=lambda value: snapshots.append(copy.deepcopy(value)),
+    ).run(request)
+
+    assert complete.status is TrajectoryStatus.COMPLETED
+    assert complete.final_output == "Recovered direct proof."
+    assert [call.label for call in complete.calls] == ["direct", "direct.recovery"]
+    assert [call.max_tokens for call in complete.calls] == [120, 118]
+    assert len(client.calls) == 2
+    assert client.calls[1][1]["use_sampling"] is False
+    assert client.calls[1][1]["extra_body"]["chat_template_kwargs"] == {
+        "enable_thinking": False
+    }
+    assert sum(
+        transition.action == "recover_empty_direct"
+        for transition in complete.transitions
+    ) == 1
+
+    boundary = next(
+        snapshot
+        for snapshot in snapshots
+        if len(snapshot.calls) == 1 and not snapshot.candidates
+    )
+    resumed_client = ScriptedClient(recovered)
+    resumed = await AletheiaOrchestrator(resumed_client, config).run(
+        request,
+        resume=json.loads(json.dumps(boundary.to_dict())),
+    )
+
+    assert resumed.to_dict() == complete.to_dict()
+    assert len(resumed_client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_empty_output_recovery_is_attempted_only_once() -> None:
+    client = ScriptedClient(
+        _completion(None, completion_tokens=2),
+        _completion(None, completion_tokens=3),
+    )
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.DIRECT)
+    )
+
+    assert result.status is TrajectoryStatus.PROTOCOL_ERROR
+    assert "direct recovery returned no final content" in (result.error or "")
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_gvr_accepts_correct_candidate() -> None:
     client = ScriptedClient(
         _completion("Candidate one.", completion_tokens=5),
@@ -440,6 +972,224 @@ async def test_gvr_accepts_correct_candidate() -> None:
     assert [call.max_tokens for call in result.calls] == [60, 10]
     assert result.verdicts[0].verdict is Verdict.CORRECT
     assert result.transitions[-1].action == "correct"
+
+
+@pytest.mark.asyncio
+async def test_gvr_rationale_score_reaches_reviser_and_is_persisted() -> None:
+    rationale = "The claimed inequality reverses when x is negative."
+    client = ScriptedClient(
+        _completion("Candidate one."),
+        _rationale_verdict("minor_fix", probability=0.2, rationale=rationale),
+        _completion("Candidate two."),
+        _rationale_verdict("correct", probability=0.9, rationale="All steps check."),
+    )
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.GVR_RATIONALE_SCORE)
+    )
+
+    assert result.status is TrajectoryStatus.ACCEPTED
+    assert result.verdicts[0].success_probability == 0.2
+    assert result.verdicts[0].rationale == rationale
+    reviser_prompt = client.calls[2][0][1]["content"]
+    assert "Success probability: 0.2" in reviser_prompt
+    assert rationale in reviser_prompt
+    roundtrip = TrajectoryResult.from_dict(result.to_dict())
+    assert roundtrip.verdicts == result.verdicts
+
+
+@pytest.mark.asyncio
+async def test_gvr_reference_rationale_scrubs_reference_only_copy() -> None:
+    forbidden = "alpha beta gamma delta epsilon zeta eta theta"
+    reference = f"Reference begins. {forbidden}. Reference ends."
+    client = ScriptedClient(
+        _completion("Candidate with a local gap."),
+        _rationale_verdict(
+            "minor_fix",
+            probability=0.15,
+            rationale=f"Safe diagnosis. {forbidden}. Retained warning.",
+        ),
+        _completion("Repaired candidate."),
+        _rationale_verdict("correct", probability=0.95, rationale="Now complete."),
+    )
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.GVR_REFERENCE_RATIONALE_SCORE, reference=reference)
+    )
+
+    assert result.status is TrajectoryStatus.ACCEPTED
+    assert result.verdicts[0].rationale == "Safe diagnosis. Retained warning."
+    assert forbidden not in client.calls[2][0][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_gvr_accepts_verdict_with_only_required_outcome() -> None:
+    client = ScriptedClient(
+        _completion("Candidate one.", completion_tokens=5),
+        _completion(tool_calls=[_tool_call("submit_verdict", {"outcome": "correct"})]),
+    )
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.GVR)
+    )
+
+    assert result.status is TrajectoryStatus.ACCEPTED
+    assert result.verdicts[0].verdict is Verdict.CORRECT
+    assert result.verdicts[0].critique == ""
+    assert result.verdicts[0].fault_category == ""
+    assert result.verdicts[0].candidate_excerpt == ""
+
+
+@pytest.mark.asyncio
+async def test_gvr_normalizes_incorrect_verdict_to_critical_flaw() -> None:
+    client = ScriptedClient(
+        _completion("Candidate one."),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "submit_verdict",
+                    {
+                        "outcome": "incorrect",
+                        "critique": "The central argument fails.",
+                    },
+                )
+            ]
+        ),
+        _completion("Candidate two."),
+        _verdict("correct"),
+    )
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.GVR)
+    )
+
+    assert result.status is TrajectoryStatus.ACCEPTED
+    assert [record.verdict for record in result.verdicts] == [
+        Verdict.CRITICAL_FLAW,
+        Verdict.CORRECT,
+    ]
+    assert result.verdicts[0].critique == "The central argument fails."
+
+
+@pytest.mark.asyncio
+async def test_gvr_retries_invalid_verdict_once_with_thinking_disabled() -> None:
+    invalid = _completion(
+        reasoning="Long analysis without the required native call.",
+        completion_tokens=2,
+    )
+    client = ScriptedClient(
+        _completion("Candidate one.", completion_tokens=5),
+        invalid,
+        _verdict("correct"),
+    )
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.GVR)
+    )
+
+    assert result.status is TrajectoryStatus.ACCEPTED
+    assert [call.role for call in result.calls] == [
+        Role.GENERATOR,
+        Role.VERIFIER,
+        Role.VERIFIER,
+    ]
+    assert [call.max_tokens for call in result.calls] == [60, 10, 8]
+    recovery_messages, recovery_kwargs = client.calls[2]
+    assert "submit_verdict call" in recovery_messages[0]["content"]
+    assert recovery_kwargs["parallel_tool_calls"] is False
+    assert recovery_kwargs["use_sampling"] is False
+    assert recovery_kwargs["extra_body"]["chat_template_kwargs"] == {
+        "enable_thinking": False
+    }
+    assert any(
+        transition.action == "recover_invalid_verdict"
+        for transition in result.transitions
+    )
+
+
+@pytest.mark.asyncio
+async def test_gvr_does_not_retry_a_verifier_that_consumed_its_phase_budget() -> None:
+    client = ScriptedClient(
+        _completion("Candidate one."),
+        _completion(
+            reasoning="Truncated verifier reasoning.",
+            completion_tokens=10,
+            finish_reason="length",
+        ),
+    )
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.GVR)
+    )
+
+    assert result.status is TrajectoryStatus.PROTOCOL_ERROR
+    assert len(client.calls) == 2
+    assert "exhausted its phase budget" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_gvr_accepts_parseable_verdict_at_the_generation_limit() -> None:
+    verdict_at_limit = _completion(
+        tool_calls=[_tool_call("submit_verdict", {"outcome": "correct"})],
+        completion_tokens=10,
+        finish_reason="length",
+    )
+    snapshots: list[TrajectoryResult] = []
+    request = _request(Condition.GVR)
+    config = _config()
+
+    complete = await AletheiaOrchestrator(
+        ScriptedClient(_completion("Candidate one."), verdict_at_limit),
+        config,
+        checkpoint=lambda value: snapshots.append(copy.deepcopy(value)),
+    ).run(request)
+
+    assert complete.status is TrajectoryStatus.ACCEPTED
+    assert complete.verdicts[0].verdict is Verdict.CORRECT
+    assert len(complete.calls) == 2
+    boundary = next(
+        snapshot
+        for snapshot in snapshots
+        if len(snapshot.calls) == 2 and not snapshot.verdicts
+    )
+    resumed_client = ScriptedClient()
+    resumed = await AletheiaOrchestrator(resumed_client, config).run(
+        request,
+        resume=json.loads(json.dumps(boundary.to_dict())),
+    )
+
+    assert resumed.to_dict() == complete.to_dict()
+    assert resumed_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_gvr_resume_after_invalid_verdict_only_dispatches_recovery() -> None:
+    candidate = _completion("Candidate one.", completion_tokens=5)
+    invalid = _completion(reasoning="No native verdict.", completion_tokens=2)
+    recovered_verdict = _verdict("correct")
+    snapshots: list[TrajectoryResult] = []
+    request = _request(Condition.GVR)
+    config = _config()
+
+    complete = await AletheiaOrchestrator(
+        ScriptedClient(candidate, invalid, recovered_verdict),
+        config,
+        checkpoint=lambda value: snapshots.append(copy.deepcopy(value)),
+    ).run(request)
+    boundary = next(
+        snapshot
+        for snapshot in snapshots
+        if len(snapshot.calls) == 2 and not snapshot.verdicts
+    )
+    resumed_client = ScriptedClient(recovered_verdict)
+
+    resumed = await AletheiaOrchestrator(resumed_client, config).run(
+        request,
+        resume=json.loads(json.dumps(boundary.to_dict())),
+    )
+
+    assert resumed.to_dict() == complete.to_dict()
+    assert len(resumed_client.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -592,16 +1342,9 @@ class ParallelSubagentClient:
                 completion_tokens=2,
             )
         if self.parent_turn == 2:
-            return _completion(
-                tool_calls=[
-                    _tool_call(
-                        "spawn_subagents",
-                        {"tasks": [{"task": "forbidden second wave"}]},
-                        "wave-two",
-                    )
-                ]
-            )
-        return _completion("Synthesized parent candidate.", completion_tokens=3)
+            assert "spawn_subagents" not in tool_names
+            return _completion("Synthesized parent candidate.", completion_tokens=3)
+        raise AssertionError("unexpected extra parent turn")
 
 
 @pytest.mark.asyncio
@@ -630,15 +1373,19 @@ async def test_subagents_have_fresh_context_parallel_budget_fanout_and_no_depth(
     )
 
     parent_calls = [call for call in result.calls if call.role is Role.GENERATOR]
-    assert len(parent_calls) == 3
+    assert len(parent_calls) == 2
     final_parent_messages = parent_calls[-1].messages
     assert any(
         message.get("reasoning_content") == "parent-only private plan"
         for message in final_parent_messages
     )
     tool_messages = [message for message in final_parent_messages if message["role"] == "tool"]
-    assert len(tool_messages) == 2
-    assert "only one subagent wave" in tool_messages[-1]["content"]
+    assert len(tool_messages) == 1
+    assert final_parent_messages[-1] == {
+        "role": "user",
+        "content": GVR_FORCED_CANDIDATE_REMINDER,
+    }
+    assert not parent_calls[-1].tools
     assert result.budget["spent_generated_tokens"] == sum(
         call.usage.completion_tokens for call in result.calls if call.usage is not None
     )
@@ -974,7 +1721,7 @@ async def test_resume_reuses_completed_child_wave_without_repeating_children() -
 
 
 @pytest.mark.asyncio
-async def test_candidate_requires_nonempty_post_tool_synthesis_and_uses_its_call_index() -> None:
+async def test_candidate_recovers_empty_post_tool_synthesis_and_uses_its_call_index() -> None:
     spawn = _tool_call(
         "spawn_subagents",
         {"tasks": [{"task": "check the provisional argument"}]},
@@ -983,14 +1730,37 @@ async def test_candidate_requires_nonempty_post_tool_synthesis_and_uses_its_call
         _completion("Provisional text is not final.", tool_calls=[spawn], completion_tokens=2),
         _completion("child finding", completion_tokens=2),
         _completion(None, completion_tokens=1),
+        _completion("Recovered synthesized candidate.", completion_tokens=3),
+        _verdict("correct"),
     )
-    failed = await AletheiaOrchestrator(empty_client, _config()).run(
+    recovered = await AletheiaOrchestrator(empty_client, _config()).run(
         _request(Condition.GVR_SUBAGENTS)
     )
 
+    assert recovered.status is TrajectoryStatus.ACCEPTED
+    assert recovered.final_output == "Recovered synthesized candidate."
+    recovery_messages, recovery_kwargs = empty_client.calls[3]
+    assert recovery_messages[-1] == {
+        "role": "user",
+        "content": GVR_FORCED_CANDIDATE_REMINDER,
+    }
+    assert recovery_kwargs["tools"] is None
+    assert recovery_kwargs["use_sampling"] is False
+    assert recovery_kwargs["extra_body"]["chat_template_kwargs"] == {
+        "enable_thinking": False
+    }
+
+    repeatedly_empty = ScriptedClient(
+        _completion(None, completion_tokens=1),
+        _completion(None, completion_tokens=1),
+    )
+    failed = await AletheiaOrchestrator(repeatedly_empty, _config()).run(
+        _request(Condition.GVR)
+    )
     assert failed.status is TrajectoryStatus.PROTOCOL_ERROR
     assert failed.final_output is None
     assert failed.candidates == []
+    assert "forced final synthesis" in (failed.error or "")
 
     successful_client = ScriptedClient(
         _completion("Still provisional.", tool_calls=[spawn], completion_tokens=2),
@@ -1007,6 +1777,54 @@ async def test_candidate_requires_nonempty_post_tool_synthesis_and_uses_its_call
     assert successful.candidates[0].call_index == 2
     assert successful.calls[2].response is not None
     assert successful.calls[2].response.message.content == successful.candidates[0].content
+
+
+@pytest.mark.asyncio
+async def test_gvr_resume_after_empty_candidate_only_dispatches_recovery() -> None:
+    empty = _completion(None, reasoning="Unfinished private work.", completion_tokens=2)
+    recovered_candidate = _completion("Recovered candidate.", completion_tokens=3)
+    final_verdict = _verdict("correct")
+    snapshots: list[TrajectoryResult] = []
+    request = _request(Condition.GVR)
+    config = _config()
+
+    complete = await AletheiaOrchestrator(
+        ScriptedClient(empty, recovered_candidate, final_verdict),
+        config,
+        checkpoint=lambda value: snapshots.append(copy.deepcopy(value)),
+    ).run(request)
+    boundary = next(
+        snapshot
+        for snapshot in snapshots
+        if len(snapshot.calls) == 1 and not snapshot.candidates
+    )
+    resumed_client = ScriptedClient(recovered_candidate, final_verdict)
+
+    resumed = await AletheiaOrchestrator(resumed_client, config).run(
+        request,
+        resume=json.loads(json.dumps(boundary.to_dict())),
+    )
+
+    assert resumed.to_dict() == complete.to_dict()
+    assert len(resumed_client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_gvr_forced_candidate_recovery_rejects_a_tool_call() -> None:
+    client = ScriptedClient(
+        _completion(None, completion_tokens=1),
+        _completion(
+            tool_calls=[_tool_call("spawn_subagents", {"tasks": [{"task": "late"}]})]
+        ),
+    )
+
+    result = await AletheiaOrchestrator(client, _config()).run(
+        _request(Condition.GVR_SUBAGENTS)
+    )
+
+    assert result.status is TrajectoryStatus.PROTOCOL_ERROR
+    assert len(client.calls) == 2
+    assert "forced final synthesis emitted a tool call" in (result.error or "")
 
 
 @pytest.mark.asyncio
@@ -1069,6 +1887,10 @@ def test_thinking_budget_tracks_the_granted_cap_and_reaches_the_request() -> Non
     assert extra_body["custom_params"] == {"thinking_budget": 56}
     assert extra_body["custom_logit_processor"] == QWEN3_THINKING_BUDGET_PROCESSOR
     assert extra_body["chat_template_kwargs"] == {"enable_thinking": True}
+    recovery_body = orchestrator._extra_body_for(60, force_no_thinking=True)
+    assert recovery_body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "custom_logit_processor" not in recovery_body
+    assert "custom_params" not in recovery_body
     assert "custom_params" not in AletheiaOrchestrator(
         ScriptedClient(), disabled
     )._extra_body_for(60)

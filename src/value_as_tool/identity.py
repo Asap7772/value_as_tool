@@ -12,17 +12,31 @@ from .config import ExperimentConfig, sha256_json
 from .judging import JUDGE_CONTEXT_RECOVERY_POLICY_SHA256
 from .orchestrator import (
     GENERATOR_SYSTEM_PROMPT,
+    GVR_FORCED_CANDIDATE_REMINDER,
+    GVR_VERDICT_RECOVERY_SUFFIX,
+    QUERY_SUCCESS_PROBABILITY_TOOL,
+    RATIONALE_SCORE_REFERENCE_VERIFIER_SYSTEM_PROMPT,
+    RATIONALE_SCORE_VALUE_SOLVER_SYSTEM_PROMPT,
+    RATIONALE_SCORE_VALUE_VERIFIER_SYSTEM_PROMPT,
+    RATIONALE_SCORE_VERDICT_RECOVERY_SUFFIX,
+    RATIONALE_SCORE_VERIFIER_SYSTEM_PROMPT,
     REFERENCE_VERIFIER_SYSTEM_PROMPT,
     REVISER_SYSTEM_PROMPT,
     SPAWN_SUBAGENTS_TOOL,
     SUBAGENT_SYSTEM_PROMPT,
+    SUBMIT_PROBABILITY_TOOL,
+    SUBMIT_RATIONALE_SCORE_TOOL,
+    SUBMIT_RATIONALE_SCORE_VERDICT_TOOL,
     SUBMIT_VERDICT_TOOL,
+    VALUE_FORCED_FINAL_REMINDER,
+    VALUE_SOLVER_SYSTEM_PROMPT,
+    VALUE_VERIFIER_SYSTEM_PROMPT,
     VERIFIER_SYSTEM_PROMPT,
 )
 from .server import SUPPORTED_SGLANG_VERSION, SUPPORTED_VLLM_VERSION
 
 EXPERIMENT_IDENTITY_SCHEMA_VERSION = 1
-SOLVER_PROTOCOL_VERSION = "aletheia-style-gvr-v1"
+SOLVER_PROTOCOL_VERSION = "aletheia-style-gvr-and-value-tool-v4-rationale-score"
 
 
 def package_source_sha256(root: str | Path | None = None) -> str:
@@ -102,14 +116,34 @@ def build_experiment_identity(config: ExperimentConfig) -> dict[str, Any]:
             "version": SOLVER_PROTOCOL_VERSION,
             "system_prompts": {
                 "generator": GENERATOR_SYSTEM_PROMPT,
+                "gvr_forced_candidate_reminder": GVR_FORCED_CANDIDATE_REMINDER,
+                "gvr_verdict_recovery_suffix": GVR_VERDICT_RECOVERY_SUFFIX,
                 "reviser": REVISER_SYSTEM_PROMPT,
                 "verifier": VERIFIER_SYSTEM_PROMPT,
                 "reference_verifier": REFERENCE_VERIFIER_SYSTEM_PROMPT,
+                "rationale_score_verifier": RATIONALE_SCORE_VERIFIER_SYSTEM_PROMPT,
+                "rationale_score_reference_verifier": (
+                    RATIONALE_SCORE_REFERENCE_VERIFIER_SYSTEM_PROMPT
+                ),
+                "rationale_score_verdict_recovery": (
+                    RATIONALE_SCORE_VERDICT_RECOVERY_SUFFIX
+                ),
                 "subagent": SUBAGENT_SYSTEM_PROMPT,
+                "value_forced_final_reminder": VALUE_FORCED_FINAL_REMINDER,
+                "value_solver": VALUE_SOLVER_SYSTEM_PROMPT,
+                "value_verifier": VALUE_VERIFIER_SYSTEM_PROMPT,
+                "rationale_score_value_solver": RATIONALE_SCORE_VALUE_SOLVER_SYSTEM_PROMPT,
+                "rationale_score_value_verifier": (
+                    RATIONALE_SCORE_VALUE_VERIFIER_SYSTEM_PROMPT
+                ),
             },
             "tools": {
                 "submit_verdict": SUBMIT_VERDICT_TOOL,
                 "spawn_subagents": SPAWN_SUBAGENTS_TOOL,
+                "query_success_probability": QUERY_SUCCESS_PROBABILITY_TOOL,
+                "submit_probability": SUBMIT_PROBABILITY_TOOL,
+                "submit_rationale_score": SUBMIT_RATIONALE_SCORE_TOOL,
+                "submit_rationale_score_verdict": SUBMIT_RATIONALE_SCORE_VERDICT_TOOL,
             },
         },
     }

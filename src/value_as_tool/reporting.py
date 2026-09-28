@@ -12,7 +12,16 @@ from typing import Any
 
 from value_as_tool.metrics import DEFAULT_COMPARISONS, compute_metrics
 
-CONDITION_ORDER = ("direct", "gvr", "gvr_subagents", "gvr_reference")
+CONDITION_ORDER = (
+    "direct",
+    "value_tool",
+    "gvr",
+    "gvr_subagents",
+    "gvr_reference",
+    "gvr_rationale_score",
+    "value_tool_rationale_score",
+    "gvr_reference_rationale_score",
+)
 BENCHMARK_LABELS = {
     "imo_proof": "IMO-Proof",
     "proofbench": "ProofBench",
@@ -96,6 +105,29 @@ def _ordered(values: Iterable[str], preferred: Sequence[str]) -> list[str]:
     )
 
 
+def _method_key(row: Mapping[str, Any]) -> tuple[str, str]:
+    method_id = str(row.get("method_id", row.get("condition", "")))
+    return method_id, str(row.get("harness_source_sha256") or "")
+
+
+def _method_sort_key(value: tuple[str, str]) -> tuple[int, str, str]:
+    method_id, source_sha256 = value
+    try:
+        order = CONDITION_ORDER.index(method_id)
+    except ValueError:
+        order = len(CONDITION_ORDER)
+    return order, method_id, source_sha256
+
+
+def _method_label(row: Mapping[str, Any]) -> str:
+    method_id, source_sha256 = _method_key(row)
+    return method_id if not source_sha256 else f"{method_id} @ {source_sha256[:12]}"
+
+
+def _access_label(row: Mapping[str, Any]) -> str:
+    return str(row.get("harness_access") or "unknown").replace("_", "-")
+
+
 def render_markdown(report: Mapping[str, Any]) -> str:
     """Render a compact human-readable view of a metrics payload."""
 
@@ -122,30 +154,51 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         (str(row["benchmark"]) for row in compatibility),
         ("imo_proof", "proofbench", "imo_answer"),
     )
-    conditions = _ordered(
-        (str(row["condition"]) for row in compatibility), CONDITION_ORDER
-    )
+    methods = sorted({_method_key(row) for row in compatibility}, key=_method_sort_key)
     compatibility_lookup = {
-        (str(row["benchmark"]), str(row["condition"])): row
+        (str(row["benchmark"]), _method_key(row)): row
         for row in compatibility
     }
+    versioned_harnesses = any(row.get("harness_id") for row in compatibility)
     labels = [BENCHMARK_LABELS.get(name, name) for name in benchmarks]
-    lines.extend(
-        [
-            "| Method | " + " | ".join(labels) + " |",
-            "|---|" + "---:|" * len(benchmarks),
-        ]
-    )
-    for condition in conditions:
+    if versioned_harnesses:
+        lines.extend(
+            [
+                "| Method | Access | " + " | ".join(labels) + " |",
+                "|---|---|" + "---:|" * len(benchmarks),
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "| Method | " + " | ".join(labels) + " |",
+                "|---|" + "---:|" * len(benchmarks),
+            ]
+        )
+    for method in methods:
+        method_rows = [row for row in compatibility if _method_key(row) == method]
+        representative = method_rows[0]
         values = [
             (
                 "N/A"
-                if (benchmark, condition) not in compatibility_lookup
-                else _percent(compatibility_lookup[(benchmark, condition)].get("value"))
+                if (benchmark, method) not in compatibility_lookup
+                else _percent(compatibility_lookup[(benchmark, method)].get("value"))
             )
             for benchmark in benchmarks
         ]
-        lines.append(f"| {condition} | " + " | ".join(values) + " |")
+        prefix = f"| {_method_label(representative)} |"
+        if versioned_harnesses:
+            prefix += f" {_access_label(representative)} |"
+        lines.append(prefix + " " + " | ".join(values) + " |")
+
+    if versioned_harnesses:
+        lines.extend(
+            [
+                "",
+                "Harness versions are shown by the first 12 characters of the source "
+                "SHA-256; JSON and CSV artifacts contain the full digest and entrypoint.",
+            ]
+        )
 
     lines.extend(
         [
@@ -155,20 +208,37 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "",
             "## Raw outcomes and cost",
             "",
-            "| Benchmark | Condition | Done | Strict success | Mean grade | Generated tokens |",
-            "|---|---|---:|---:|---:|---:|",
+            (
+                "| Benchmark | Method | Access | Done | Strict success | Mean grade | "
+                "Generated tokens | Value queries | Value-verifier tokens |"
+                if versioned_harnesses
+                else "| Benchmark | Condition | Done | Strict success | Mean grade | "
+                "Generated tokens | Value queries | Value-verifier tokens |"
+            ),
+            (
+                "|---|---|---|---:|---:|---:|---:|---:|---:|"
+                if versioned_harnesses
+                else "|---|---|---:|---:|---:|---:|---:|---:|"
+            ),
         ]
     )
     for row in summary:
         done = f"{row['completed']}/{row['scheduled']}"
+        access_column = f" {_access_label(row)} |" if versioned_harnesses else ""
         lines.append(
-            "| {benchmark} | {condition} | {done} | {success} | {grade} | {tokens:,} |".format(
+            (
+                "| {benchmark} | {method} |{access_column} {done} | {success} | {grade} | "
+                "{tokens:,} | {queries:,} | {verifier_tokens:,} |"
+            ).format(
                 benchmark=BENCHMARK_LABELS.get(str(row["benchmark"]), row["benchmark"]),
-                condition=row["condition"],
+                method=_method_label(row),
+                access_column=access_column,
                 done=done,
                 success=_percent(row.get("raw_success_rate")),
                 grade=_number(row.get("mean_grade")),
                 tokens=int(row.get("generated_tokens", 0)),
+                queries=int(row.get("value_queries", 0)),
+                verifier_tokens=int(row.get("value_verifier_generated_tokens", 0)),
             )
         )
 
@@ -177,7 +247,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "",
             "## Budget curves",
             "",
-            "| Benchmark | Condition | k | pass@k | best grade@k | "
+            "| Benchmark | Method | k | pass@k | best grade@k | "
             "final generated cost@k | incurred generated cost@k |",
             "|---|---|---:|---:|---:|---:|---:|",
         ]
@@ -187,7 +257,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             "| {benchmark} | {condition} | {k} | {passed} | {best} | {generated:,.0f} | "
             "{incurred:,.0f} |".format(
                 benchmark=BENCHMARK_LABELS.get(str(row["benchmark"]), row["benchmark"]),
-                condition=row["condition"],
+                condition=_method_label(row),
                 k=row["k"],
                 passed=_percent(row.get("pass_at_k")),
                 best=_number(row.get("best_grade_at_k")),
@@ -211,9 +281,22 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     )
     for row in bootstrap:
         interval = f"[{_number(row.get('ci95_low'))}, {_number(row.get('ci95_high'))}]"
+        baseline_source = row.get("baseline_harness_source_sha256")
+        baseline_label = str(row["baseline"])
+        if baseline_source:
+            baseline_label += f" @ {str(baseline_source)[:12]}"
+        treatment_access = _access_label(row)
+        baseline_access = str(row.get("baseline_harness_access") or "unknown").replace(
+            "_", "-"
+        )
+        access_note = (
+            f" ({treatment_access} vs {baseline_access})"
+            if treatment_access != baseline_access
+            else ""
+        )
         lines.append(
             f"| {BENCHMARK_LABELS.get(str(row['benchmark']), row['benchmark'])} | "
-            f"{row['condition']} − {row['baseline']} | {row['metric']} | "
+            f"{_method_label(row)} − {baseline_label}{access_note} | {row['metric']} | "
             f"{_number(row.get('mean_delta'))} | {interval} | {row['paired_n']} |"
         )
 

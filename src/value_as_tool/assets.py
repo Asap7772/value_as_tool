@@ -50,6 +50,12 @@ def model_snapshot_path(asset_root: str | Path, model: str, revision: str) -> Pa
     return Path(asset_root) / "models" / _safe_repo_id(model) / revision
 
 
+def model_manifest_path(config: ExperimentConfig) -> Path:
+    """Return the experiment-scoped model-role manifest path."""
+
+    return config.paths.artifact_root / "prepared" / "models" / "manifest.json"
+
+
 def prepare_benchmark_assets(config: ExperimentConfig) -> dict[str, Any]:
     """Download and normalize the three pinned benchmark snapshots."""
 
@@ -156,12 +162,16 @@ def prepare_model_assets(
             "path": str(Path(resolved).resolve()),
             "tokenizer_only": tokenizer_only,
         }
-    atomic_write_json(config.paths.asset_root / "models" / "manifest.json", manifest)
+    atomic_write_json(model_manifest_path(config), manifest)
     return manifest
 
 
 def load_model_manifest(config: ExperimentConfig) -> dict[str, Any]:
-    path = config.paths.asset_root / "models" / "manifest.json"
+    path = model_manifest_path(config)
+    if not path.exists():
+        # Read-only compatibility for artifacts prepared before manifests were
+        # scoped per experiment. New prepares never overwrite this shared file.
+        path = config.paths.asset_root / "models" / "manifest.json"
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise TypeError(f"invalid model manifest: {path}")
@@ -172,6 +182,7 @@ __all__ = [
     "load_model_manifest",
     "load_prepared_benchmarks",
     "model_snapshot_path",
+    "model_manifest_path",
     "prepare_benchmark_assets",
     "prepare_model_assets",
     "prepared_benchmark_path",

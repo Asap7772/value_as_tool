@@ -8,10 +8,13 @@ particular validation framework.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from enum import Enum, StrEnum
 from typing import Any
+
+RATIONALE_MAX_CHARS = 1_200
 
 
 class Condition(StrEnum):
@@ -21,14 +24,23 @@ class Condition(StrEnum):
     GVR = "gvr"
     GVR_SUBAGENTS = "gvr_subagents"
     GVR_REFERENCE = "gvr_reference"
+    VALUE_TOOL = "value_tool"
+    GVR_RATIONALE_SCORE = "gvr_rationale_score"
+    VALUE_TOOL_RATIONALE_SCORE = "value_tool_rationale_score"
+    GVR_REFERENCE_RATIONALE_SCORE = "gvr_reference_rationale_score"
 
 
 class Role(StrEnum):
     DIRECT = "direct"
+    PLANNER = "planner"
+    WORKER = "worker"
+    REVIEWER = "reviewer"
     GENERATOR = "generator"
     VERIFIER = "verifier"
     REVISER = "reviser"
     SUBAGENT = "subagent"
+    VALUE_SOLVER = "value_solver"
+    VALUE_VERIFIER = "value_verifier"
 
 
 class Verdict(StrEnum):
@@ -322,8 +334,9 @@ class TrajectoryRequest:
     benchmark: str
     problem_id: str
     problem: str
-    condition: Condition
+    condition: Condition | None
     seed: int
+    harness_id: str | None = None
     reference_proof: str | None = None
     solver_prompt: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -343,15 +356,37 @@ class TrajectoryRequest:
             benchmark=_required_string(value, "benchmark"),
             problem_id=_required_string(value, "problem_id"),
             problem=_required_string(value, "problem", allow_empty=True),
-            condition=Condition(_required_string(value, "condition")),
+            condition=(
+                Condition(_required_string(value, "condition"))
+                if value.get("condition") is not None
+                else None
+            ),
             seed=_required_int(value, "seed"),
+            harness_id=(
+                _required_string(value, "harness_id")
+                if value.get("harness_id") is not None
+                else None
+            ),
             reference_proof=reference,
             solver_prompt=solver_prompt,
             metadata=dict(metadata),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return _jsonable(asdict(self))
+        value = _jsonable(asdict(self))
+        if self.condition is None:
+            value.pop("condition", None)
+        if self.harness_id is None:
+            value.pop("harness_id", None)
+        return value
+
+    @property
+    def method_id(self) -> str:
+        if self.harness_id:
+            return self.harness_id
+        if self.condition is not None:
+            return self.condition.value
+        raise ValueError("trajectory request has neither harness_id nor condition")
 
 
 @dataclass(frozen=True)
@@ -436,9 +471,40 @@ class VerdictRecord:
     fault_category: str
     candidate_excerpt: str
     call_index: int
+    success_probability: float | None = None
+    rationale: str = ""
+
+    def __post_init__(self) -> None:
+        probability = self.success_probability
+        if probability is not None and (
+            isinstance(probability, bool)
+            or not isinstance(probability, (int, float))
+            or not math.isfinite(probability)
+            or not 0 <= probability <= 1
+        ):
+            raise ValueError(
+                "verdict success_probability must be a finite number between zero and one"
+            )
+        if (probability is None) != (not self.rationale):
+            raise ValueError(
+                "verdict rationale and success_probability must either both be present "
+                "or both be absent"
+            )
+        if len(self.rationale) > RATIONALE_MAX_CHARS:
+            raise ValueError("verdict rationale exceeds its character limit")
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> VerdictRecord:
+        probability = value.get("success_probability")
+        if probability is not None and (
+            isinstance(probability, bool)
+            or not isinstance(probability, (int, float))
+            or not math.isfinite(probability)
+            or not 0 <= probability <= 1
+        ):
+            raise ValueError(
+                "verdict success_probability must be a finite number between zero and one"
+            )
         return cls(
             cycle=_required_int(value, "cycle"),
             verdict=Verdict(_required_string(value, "verdict")),
@@ -446,10 +512,20 @@ class VerdictRecord:
             fault_category=_required_string(value, "fault_category", allow_empty=True),
             candidate_excerpt=_required_string(value, "candidate_excerpt", allow_empty=True),
             call_index=_required_int(value, "call_index"),
+            success_probability=(
+                float(probability) if probability is not None else None
+            ),
+            rationale=_required_string(value, "rationale", allow_empty=True)
+            if "rationale" in value
+            else "",
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return _jsonable(asdict(self))
+        value = _jsonable(asdict(self))
+        if self.success_probability is None:
+            value.pop("success_probability", None)
+            value.pop("rationale", None)
+        return value
 
 
 @dataclass(frozen=True)
@@ -484,6 +560,72 @@ class SubagentRecord:
 
 
 @dataclass(frozen=True)
+class ValueEstimateRecord:
+    query_index: int
+    probability: float
+    solver_call_index: int
+    verifier_call_index: int
+    tool_call_id: str
+    trace_sha256: str
+    rationale: str = ""
+
+    def __post_init__(self) -> None:
+        if len(self.rationale) > RATIONALE_MAX_CHARS:
+            raise ValueError("value-estimate rationale exceeds its character limit")
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ValueEstimateRecord:
+        expected_fields = {
+            "query_index",
+            "probability",
+            "solver_call_index",
+            "verifier_call_index",
+            "tool_call_id",
+            "trace_sha256",
+            "rationale",
+        }
+        unexpected_fields = set(value) - expected_fields
+        if unexpected_fields:
+            names = ", ".join(sorted(str(field) for field in unexpected_fields))
+            raise ValueError(f"value estimate contains unexpected fields: {names}")
+        query_index = _required_int(value, "query_index")
+        solver_call_index = _required_int(value, "solver_call_index")
+        verifier_call_index = _required_int(value, "verifier_call_index")
+        if min(query_index, solver_call_index, verifier_call_index) < 0:
+            raise ValueError("value-estimate indices must be non-negative")
+        probability = value.get("probability")
+        if (
+            isinstance(probability, bool)
+            or not isinstance(probability, (int, float))
+            or not math.isfinite(probability)
+            or not 0 <= probability <= 1
+        ):
+            raise ValueError("probability must be a finite number between zero and one")
+        trace_sha256 = _required_string(value, "trace_sha256")
+        if len(trace_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in trace_sha256
+        ):
+            raise ValueError("trace_sha256 must be a lowercase SHA-256 digest")
+        return cls(
+            query_index=query_index,
+            probability=float(probability),
+            solver_call_index=solver_call_index,
+            verifier_call_index=verifier_call_index,
+            tool_call_id=_required_string(value, "tool_call_id"),
+            trace_sha256=trace_sha256,
+            rationale=_required_string(value, "rationale", allow_empty=True)
+            if "rationale" in value
+            else "",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        value = _jsonable(asdict(self))
+        if not self.rationale:
+            value.pop("rationale", None)
+        return value
+
+
+@dataclass(frozen=True)
 class TransitionRecord:
     cycle: int
     source: str
@@ -514,6 +656,7 @@ class TrajectoryResult:
     candidates: list[CandidateRecord] = field(default_factory=list)
     verdicts: list[VerdictRecord] = field(default_factory=list)
     subagents: list[SubagentRecord] = field(default_factory=list)
+    value_estimates: list[ValueEstimateRecord] = field(default_factory=list)
     transitions: list[TransitionRecord] = field(default_factory=list)
     usage: TokenUsage = field(default_factory=TokenUsage)
     budget: Mapping[str, Any] = field(default_factory=dict)
@@ -525,6 +668,9 @@ class TrajectoryResult:
         candidates = _required_sequence(value.get("candidates", []), "candidates")
         verdicts = _required_sequence(value.get("verdicts", []), "verdicts")
         subagents = _required_sequence(value.get("subagents", []), "subagents")
+        value_estimates = _required_sequence(
+            value.get("value_estimates", []), "value_estimates"
+        )
         transitions = _required_sequence(value.get("transitions", []), "transitions")
         budget = value.get("budget", {})
         if not isinstance(budget, Mapping):
@@ -547,6 +693,10 @@ class TrajectoryResult:
             subagents=[
                 SubagentRecord.from_dict(_required_mapping(item, "subagent")) for item in subagents
             ],
+            value_estimates=[
+                ValueEstimateRecord.from_dict(_required_mapping(item, "value estimate"))
+                for item in value_estimates
+            ],
             transitions=[
                 TransitionRecord.from_dict(_required_mapping(item, "transition"))
                 for item in transitions
@@ -558,6 +708,13 @@ class TrajectoryResult:
 
     def to_dict(self) -> dict[str, Any]:
         value = _jsonable(asdict(self))
+        for verdict in value.get("verdicts", []):
+            if isinstance(verdict, dict) and verdict.get("success_probability") is None:
+                verdict.pop("success_probability", None)
+                verdict.pop("rationale", None)
+        for estimate in value.get("value_estimates", []):
+            if isinstance(estimate, dict) and not estimate.get("rationale"):
+                estimate.pop("rationale", None)
         # Transport ``raw`` objects duplicate the complete assistant message,
         # tool arguments, and usage for every call. Keep those on the in-memory
         # client objects for diagnostics, but make trajectory artifacts compact
@@ -654,6 +811,7 @@ __all__ = [
     "TrajectoryResult",
     "TrajectoryStatus",
     "TransitionRecord",
+    "ValueEstimateRecord",
     "Verdict",
     "VerdictRecord",
 ]

@@ -7278,6 +7278,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
+    { name = "dill" },
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "jinja2" },
@@ -7308,6 +7309,7 @@ vllm = [
 [package.metadata]
 requires-dist = [
     { name = "datasets", specifier = ">=3.5,<5" },
+    { name = "dill", specifier = ">=0.4,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "huggingface-hub", specifier = ">=0.36" },
     { name = "jinja2", specifier = ">=3.1,<4" },

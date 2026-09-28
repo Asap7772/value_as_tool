@@ -12,6 +12,7 @@ from typing import Any
 
 from value_as_tool.benchmarks import BenchmarkItem, benchmark_spec
 from value_as_tool.config import ExperimentConfig
+from value_as_tool.harnesses import HarnessSpec, resolve_harness
 from value_as_tool.schemas import Condition, TrajectoryRequest
 from value_as_tool.storage import ArtifactMismatchError, atomic_write_json, canonical_json
 
@@ -33,18 +34,53 @@ class ScheduleItem:
     run_id: str
     benchmark: str
     problem_id: str
-    condition: Condition
+    condition: Condition | None
     seed: int
     problem: str
     problem_fingerprint: str
+    harness_id: str | None = None
+    harness_entrypoint: str | None = None
+    harness_source_sha256: str | None = None
+    harness_access: str | None = None
     reference_proof: str | None = None
     golden_answer: str | None = None
     rubric: Any = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        harness_values = (
+            self.harness_id,
+            self.harness_entrypoint,
+            self.harness_source_sha256,
+            self.harness_access,
+        )
+        if any(value is not None for value in harness_values):
+            if any(not isinstance(value, str) or not value for value in harness_values):
+                raise ValueError("harness schedule identity must be complete")
+            assert self.harness_source_sha256 is not None
+            if len(self.harness_source_sha256) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in self.harness_source_sha256
+            ):
+                raise ValueError("harness source hash must be a lowercase SHA-256 digest")
+            if self.harness_access not in {"blind", "reference_assisted"}:
+                raise ValueError("unsupported harness access class")
+        elif self.condition is None:
+            raise ValueError("a schedule item requires a harness or legacy condition")
+
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
-        value["condition"] = self.condition.value
+        value["condition"] = self.condition.value if self.condition is not None else None
+        # Keep legacy schema-v1 bytes and fingerprints stable.  Harness fields
+        # are an additive extension emitted only for harness-native schedules.
+        if self.harness_id is None:
+            for key in (
+                "harness_id",
+                "harness_entrypoint",
+                "harness_source_sha256",
+                "harness_access",
+            ):
+                value.pop(key)
         return value
 
     @classmethod
@@ -54,10 +90,20 @@ class ScheduleItem:
             run_id=str(value["run_id"]),
             benchmark=str(value["benchmark"]),
             problem_id=str(value["problem_id"]),
-            condition=Condition(str(value["condition"])),
+            condition=(
+                Condition(str(value["condition"]))
+                if value.get("condition") is not None
+                else None
+            ),
             seed=int(value["seed"]),
             problem=str(value["problem"]),
             problem_fingerprint=str(value["problem_fingerprint"]),
+            harness_id=_optional_string(value.get("harness_id")),
+            harness_entrypoint=_optional_string(value.get("harness_entrypoint")),
+            harness_source_sha256=_optional_string(
+                value.get("harness_source_sha256")
+            ),
+            harness_access=_optional_string(value.get("harness_access")),
             reference_proof=_optional_string(value.get("reference_proof")),
             golden_answer=_optional_string(value.get("golden_answer")),
             rubric=value.get("rubric"),
@@ -73,12 +119,20 @@ class ScheduleItem:
             "golden_answer": self.golden_answer,
             "rubric": self.rubric,
         }
+        if self.harness_id is not None:
+            metadata.update(
+                harness_id=self.harness_id,
+                harness_entrypoint=self.harness_entrypoint,
+                harness_source_sha256=self.harness_source_sha256,
+                harness_access=self.harness_access,
+            )
         return TrajectoryRequest(
             benchmark=self.benchmark,
             problem_id=self.problem_id,
             problem=self.problem,
             condition=self.condition,
             seed=self.seed,
+            harness_id=self.harness_id,
             reference_proof=self.reference_proof,
             metadata=metadata,
         )
@@ -221,6 +275,19 @@ def _condition(value: Condition | str) -> Condition:
     return value if isinstance(value, Condition) else Condition(value)
 
 
+def _resolve_harnesses(entrypoints: Iterable[str]) -> tuple[HarnessSpec, ...]:
+    specs = tuple(resolve_harness(str(entrypoint)) for entrypoint in entrypoints)
+    if not specs:
+        raise ValueError("harnesses must be non-empty")
+    ids = [spec.harness_id for spec in specs]
+    if len(ids) != len(set(ids)):
+        raise ValueError("selected harnesses must have unique harness IDs")
+    for spec in specs:
+        if not spec.entrypoint or not spec.source_sha256:
+            raise ValueError(f"harness {spec.harness_id!r} has incomplete identity")
+    return specs
+
+
 def _benchmark_order(keys: Iterable[str]) -> list[str]:
     preferred = ("imo_proof", "proofbench", "imo_answer")
     key_set = set(keys)
@@ -232,6 +299,7 @@ def build_schedule(
     config: ExperimentConfig,
     *,
     conditions: Iterable[Condition | str] | None = None,
+    harnesses: Iterable[str] | None = None,
     seeds: Iterable[int] | None = None,
     config_fingerprint: str | None = None,
 ) -> Schedule:
@@ -247,12 +315,34 @@ def build_schedule(
     )
     if not selected_fingerprint:
         raise ValueError("config_fingerprint must not be empty")
-    selected_conditions = tuple(
-        _condition(value)
-        for value in (config.evaluation.conditions if conditions is None else conditions)
+    if conditions is not None and harnesses is not None:
+        raise ValueError("conditions and harnesses are mutually exclusive selectors")
+    configured_harnesses = config.evaluation.harnesses
+    use_harnesses = harnesses is not None or (
+        conditions is None and configured_harnesses is not None
+    )
+    selected_harnesses = (
+        _resolve_harnesses(
+            harnesses if harnesses is not None else configured_harnesses or ()
+        )
+        if use_harnesses
+        else ()
+    )
+    selected_conditions = (
+        ()
+        if use_harnesses
+        else tuple(
+            _condition(value)
+            for value in (
+                config.evaluation.conditions if conditions is None else conditions
+            )
+        )
     )
     selected_seeds = tuple(config.evaluation.seeds if seeds is None else seeds)
-    if not selected_conditions or len(set(selected_conditions)) != len(selected_conditions):
+    if not use_harnesses and (
+        not selected_conditions
+        or len(set(selected_conditions)) != len(selected_conditions)
+    ):
         raise ValueError("conditions must be non-empty and unique")
     if (
         not selected_seeds
@@ -262,19 +352,40 @@ def build_schedule(
         raise ValueError("seeds must be non-empty unique integers")
 
     records: list[ScheduleItem] = []
-    seen_identities: set[tuple[str, str, Condition, int]] = set()
-    for outer_benchmark in _benchmark_order(problems_by_benchmark):
+    seen_identities: set[tuple[str, str, str, str, int]] = set()
+    selected_benchmarks = set(config.evaluation.benchmarks)
+    available_benchmarks = selected_benchmarks & set(problems_by_benchmark)
+    for outer_benchmark in _benchmark_order(available_benchmarks):
         source_items = problems_by_benchmark[outer_benchmark]
         for index, source_item in enumerate(source_items):
             problem = _normalize_problem(outer_benchmark, source_item, index)
-            for condition in selected_conditions:
-                if (
-                    condition is Condition.GVR_REFERENCE
-                    and not problem.supports_reference_verification
-                ):
+            methods: tuple[HarnessSpec | Condition, ...] = (
+                selected_harnesses if use_harnesses else selected_conditions
+            )
+            for method in methods:
+                if isinstance(method, HarnessSpec):
+                    condition = method.condition
+                    method_id = method.harness_id
+                    method_source = method.source_sha256
+                    requires_reference = method.requires_reference
+                else:
+                    condition = method
+                    method_id = method.value
+                    method_source = ""
+                    requires_reference = condition in {
+                        Condition.GVR_REFERENCE,
+                        Condition.GVR_REFERENCE_RATIONALE_SCORE,
+                    }
+                if requires_reference and not problem.supports_reference_verification:
                     continue
                 for seed in selected_seeds:
-                    identity = (problem.benchmark, problem.problem_id, condition, seed)
+                    identity = (
+                        problem.benchmark,
+                        problem.problem_id,
+                        method_id,
+                        method_source,
+                        seed,
+                    )
                     if identity in seen_identities:
                         raise ValueError(f"duplicate schedule identity: {identity!r}")
                     seen_identities.add(identity)
@@ -283,9 +394,23 @@ def build_schedule(
                         "benchmark": problem.benchmark,
                         "problem_id": problem.problem_id,
                         "problem_fingerprint": problem.fingerprint,
-                        "condition": condition.value,
                         "seed": seed,
                     }
+                    if isinstance(method, HarnessSpec):
+                        run_material.update(
+                            harness_id=method.harness_id,
+                            harness_entrypoint=method.entrypoint,
+                            harness_source_sha256=method.source_sha256,
+                            harness_access=method.access,
+                            condition=(
+                                method.condition.value
+                                if method.condition is not None
+                                else None
+                            ),
+                        )
+                    else:
+                        # Preserve the legacy run-ID material exactly.
+                        run_material["condition"] = condition.value
                     run_id = f"run-{stable_fingerprint(run_material)[:32]}"
                     records.append(
                         ScheduleItem(
@@ -297,6 +422,26 @@ def build_schedule(
                             seed=seed,
                             problem=problem.problem,
                             problem_fingerprint=problem.fingerprint,
+                            harness_id=(
+                                method.harness_id
+                                if isinstance(method, HarnessSpec)
+                                else None
+                            ),
+                            harness_entrypoint=(
+                                method.entrypoint
+                                if isinstance(method, HarnessSpec)
+                                else None
+                            ),
+                            harness_source_sha256=(
+                                method.source_sha256
+                                if isinstance(method, HarnessSpec)
+                                else None
+                            ),
+                            harness_access=(
+                                method.access
+                                if isinstance(method, HarnessSpec)
+                                else None
+                            ),
                             reference_proof=problem.reference_proof,
                             golden_answer=problem.golden_answer,
                             rubric=problem.rubric,

@@ -17,7 +17,18 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-Condition = Literal["direct", "gvr", "gvr_subagents", "gvr_reference"]
+Condition = Literal[
+    "direct",
+    "gvr",
+    "gvr_subagents",
+    "gvr_reference",
+    "value_tool",
+    "gvr_rationale_score",
+    "value_tool_rationale_score",
+    "gvr_reference_rationale_score",
+]
+Benchmark = Literal["imo_proof", "proofbench", "imo_answer"]
+VerifierFeedbackMode = Literal["legacy", "rationale_score"]
 SolverBackend = Literal["sglang", "vllm"]
 
 
@@ -267,6 +278,37 @@ class SubagentsConfig(FrozenModel):
         return self
 
 
+class ValueToolConfig(FrozenModel):
+    max_queries: int = 3
+    verifier_tokens: int = 32_768
+    final_response_reserve_tokens: int = 32_768
+
+    @field_validator(
+        "max_queries",
+        "verifier_tokens",
+        "final_response_reserve_tokens",
+        mode="before",
+    )
+    @classmethod
+    def strict_integer(cls, value: Any) -> Any:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("value-tool limits must be integers")
+        return value
+
+    @model_validator(mode="after")
+    def validate_value_tool(self) -> ValueToolConfig:
+        values = self.model_dump()
+        if any(value <= 0 for value in values.values()):
+            raise ValueError("all value-tool limits must be positive integers")
+        return self
+
+
+class VerifierFeedbackConfig(FrozenModel):
+    """Select the information returned from a verifier to its solver."""
+
+    mode: VerifierFeedbackMode = "legacy"
+
+
 class EvaluationConfig(FrozenModel):
     conditions: tuple[Condition, ...] = (
         "direct",
@@ -274,16 +316,50 @@ class EvaluationConfig(FrozenModel):
         "gvr_subagents",
         "gvr_reference",
     )
+    # Harness entrypoints use the explicit ``module:attribute`` form.  This is
+    # optional so existing condition-based experiment files retain byte-for-
+    # byte equivalent semantics; when present it is the schedule's method
+    # selector and ``conditions`` is only a legacy default.
+    harnesses: tuple[str, ...] | None = None
+    benchmarks: tuple[Benchmark, ...] = ("imo_proof", "proofbench", "imo_answer")
     seeds: tuple[int, ...] = (0, 1, 2)
     direct_answer_compatibility_seed: int = 0
     bootstrap_samples: int = 10_000
     judge_reasoning_effort: Literal["low", "medium", "high"] = "medium"
     judge_output_tokens: int = 95_000
 
+    @field_validator("harnesses")
+    @classmethod
+    def validate_harness_entrypoints(
+        cls, value: tuple[str, ...] | None
+    ) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        if not value or len(value) != len(set(value)):
+            raise ValueError("harnesses must be non-empty and unique when configured")
+        for entrypoint in value:
+            module, separator, attribute = entrypoint.partition(":")
+            if (
+                not separator
+                or not module
+                or not attribute
+                or entrypoint != entrypoint.strip()
+                or any(not part.isidentifier() for part in module.split("."))
+                or not attribute.isidentifier()
+            ):
+                raise ValueError(
+                    "harness entrypoints must use an explicit module:attribute import path"
+                )
+        return value
+
     @model_validator(mode="after")
     def validate_evaluation(self) -> EvaluationConfig:
-        if not self.conditions or len(self.conditions) != len(set(self.conditions)):
-            raise ValueError("conditions must be non-empty and unique")
+        if len(self.conditions) != len(set(self.conditions)):
+            raise ValueError("conditions must be unique")
+        if self.harnesses is None and not self.conditions:
+            raise ValueError("conditions must be non-empty without harnesses")
+        if not self.benchmarks or len(self.benchmarks) != len(set(self.benchmarks)):
+            raise ValueError("benchmarks must be non-empty and unique")
         if (
             not self.seeds
             or len(self.seeds) != len(set(self.seeds))
@@ -299,6 +375,7 @@ class EvaluationConfig(FrozenModel):
 
 class RuntimeConfig(FrozenModel):
     solver_backend: SolverBackend = "sglang"
+    solver_tensor_parallel_size: int = 1
     request_timeout_seconds: float = 18_000
     max_retries: int = 3
     max_concurrency: int = 16
@@ -312,7 +389,12 @@ class RuntimeConfig(FrozenModel):
             raise ValueError("request timeout must be positive")
         if self.max_retries < 0:
             raise ValueError("max_retries must be non-negative")
-        if min(self.max_concurrency, self.solve_shards, self.judge_shards) <= 0:
+        if min(
+            self.solver_tensor_parallel_size,
+            self.max_concurrency,
+            self.solve_shards,
+            self.judge_shards,
+        ) <= 0:
             raise ValueError("concurrency and shard counts must be positive")
         return self
 
@@ -325,21 +407,72 @@ class ExperimentConfig(FrozenModel):
     sampling: SamplingConfig = SamplingConfig()
     budget: BudgetConfig = BudgetConfig()
     subagents: SubagentsConfig = SubagentsConfig()
+    value_tool: ValueToolConfig = ValueToolConfig()
+    verifier_feedback: VerifierFeedbackConfig = VerifierFeedbackConfig()
     evaluation: EvaluationConfig = EvaluationConfig()
     runtime: RuntimeConfig = RuntimeConfig()
 
     @model_validator(mode="after")
     def validate_cross_section_constraints(self) -> ExperimentConfig:
+        rationale_conditions = {
+            "gvr_rationale_score",
+            "value_tool_rationale_score",
+            "gvr_reference_rationale_score",
+        }
+        legacy_verifier_conditions = {
+            "gvr",
+            "gvr_subagents",
+            "gvr_reference",
+            "value_tool",
+        }
+        # A harness owns its feedback protocol, so legacy and rationale-score
+        # implementations can coexist in one harness-selected experiment.  The
+        # global switch remains enforced for old condition-selected configs.
+        if self.evaluation.harnesses is None:
+            selected_conditions = set(self.evaluation.conditions)
+            if self.verifier_feedback.mode == "rationale_score":
+                if selected_conditions & legacy_verifier_conditions:
+                    raise ValueError(
+                        "rationale_score feedback requires explicitly versioned "
+                        "rationale-score conditions"
+                    )
+            elif selected_conditions & rationale_conditions:
+                raise ValueError(
+                    "rationale-score conditions require "
+                    "verifier_feedback.mode=rationale_score"
+                )
         subagent_need = (
             self.subagents.max_children * self.subagents.child_tokens
             + self.subagents.final_candidate_reserve_tokens
         )
         if subagent_need > self.budget.initial_generator_tokens:
             raise ValueError("subagent wave and synthesis reserves exceed initial Generator cap")
+        if self.value_tool.verifier_tokens < self.budget.minimum_call_tokens:
+            raise ValueError("value-tool verifier cap is smaller than the minimum call size")
+        if self.value_tool.final_response_reserve_tokens < self.budget.minimum_call_tokens:
+            raise ValueError(
+                "value-tool final response reserve is smaller than the minimum call size"
+            )
+        value_tool_reserved = (
+            self.value_tool.max_queries * self.value_tool.verifier_tokens
+            + self.value_tool.final_response_reserve_tokens
+            + self.budget.minimum_call_tokens
+        )
+        if value_tool_reserved > self.budget.generated_tokens:
+            raise ValueError(
+                "value-tool query caps, final response reserve, and minimum solver call "
+                "exceed the shared generated-token budget"
+            )
         return self
 
     def to_dict(self) -> dict[str, Any]:
-        return self.model_dump(mode="json")
+        value = self.model_dump(mode="json")
+        evaluation = value.get("evaluation")
+        if isinstance(evaluation, dict) and evaluation.get("harnesses") is None:
+            # Preserve condition-only experiment identities created before the
+            # additive harness selector existed.
+            evaluation.pop("harnesses")
+        return value
 
     @property
     def fingerprint(self) -> str:
