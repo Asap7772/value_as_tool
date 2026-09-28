@@ -86,11 +86,21 @@ source = Path(sys.argv[1]).resolve()
 context = load_context(source)
 print(context.artifact_root)
 print(context.asset_root)
+print(context.config.runtime.solver_backend)
+print(getattr(context.config.runtime, "solver_tensor_parallel_size", 1))
 PY
 )
 readonly ARTIFACT_ROOT=${configured_paths[0]}
 readonly ASSET_ROOT=${configured_paths[1]}
+readonly SOLVER_BACKEND=${configured_paths[2]}
+readonly CONFIGURED_SOLVER_TENSOR_PARALLEL_SIZE=${configured_paths[3]}
+readonly SOLVER_TENSOR_PARALLEL_SIZE=${VALUE_AS_TOOL_SOLVER_TENSOR_PARALLEL_SIZE:-${CONFIGURED_SOLVER_TENSOR_PARALLEL_SIZE}}
+[[ $SOLVER_TENSOR_PARALLEL_SIZE =~ ^[1-9][0-9]*$ ]] || {
+  echo "solver tensor-parallel size must be a positive integer" >&2
+  exit 2
+}
 readonly RUNTIME_KEY=${SLURM_JOB_ID:-manual}-${SLURM_ARRAY_TASK_ID:-0}-${EXPERIMENT_STAGE}
+readonly LOCAL_RUNTIME_ROOT=/tmp/value-as-tool-${UID}/${RUNTIME_KEY}
 
 export HF_HOME=${ASSET_ROOT}/huggingface
 export HF_HUB_CACHE=${HF_HOME}/hub
@@ -98,17 +108,18 @@ export HF_DATASETS_CACHE=${ASSET_ROOT}/datasets
 export TRANSFORMERS_CACHE=${ASSET_ROOT}/transformers
 export TORCH_HOME=${ASSET_ROOT}/torch
 export UV_CACHE_DIR=${ASSET_ROOT}/uv
-export TRITON_CACHE_DIR=${ASSET_ROOT}/triton/${RUNTIME_KEY}
-export SGLANG_CACHE_DIR=${ASSET_ROOT}/sglang/${RUNTIME_KEY}
-export XDG_CACHE_HOME=${ASSET_ROOT}/xdg/${RUNTIME_KEY}
-export TMPDIR=${ASSET_ROOT}/tmp/${RUNTIME_KEY}
-export VLLM_RPC_BASE_PATH=/tmp/value-as-tool-vllm-${UID}/${RUNTIME_KEY}
+export TRITON_CACHE_DIR=${LOCAL_RUNTIME_ROOT}/triton
+export SGLANG_CACHE_DIR=${LOCAL_RUNTIME_ROOT}/sglang
+export XDG_CACHE_HOME=${LOCAL_RUNTIME_ROOT}/xdg
+export TMPDIR=${LOCAL_RUNTIME_ROOT}/tmp
+export VLLM_RPC_BASE_PATH=${LOCAL_RUNTIME_ROOT}/vllm-rpc
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 mkdir -p "$ARTIFACT_ROOT/logs" "$HF_HUB_CACHE" "$HF_DATASETS_CACHE" \
-  "$TRANSFORMERS_CACHE" "$TORCH_HOME" "$UV_CACHE_DIR" "$TRITON_CACHE_DIR" \
-  "$SGLANG_CACHE_DIR" "$XDG_CACHE_HOME" "$TMPDIR" "$VLLM_RPC_BASE_PATH"
-chmod 700 "$TMPDIR" "$VLLM_RPC_BASE_PATH"
+    "$TRANSFORMERS_CACHE" "$TORCH_HOME" "$UV_CACHE_DIR" "$TRITON_CACHE_DIR" \
+    "$SGLANG_CACHE_DIR" "$XDG_CACHE_HOME" "$TMPDIR" "$VLLM_RPC_BASE_PATH"
+chmod 700 "$LOCAL_RUNTIME_ROOT" "$TRITON_CACHE_DIR" "$SGLANG_CACHE_DIR" \
+  "$XDG_CACHE_HOME" "$TMPDIR" "$VLLM_RPC_BASE_PATH"
 
 # Prevent duplicate execution of the same array cell while still permitting
 # different stages and shard IDs to run concurrently.

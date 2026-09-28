@@ -34,6 +34,16 @@ def _executable(env_name: str, default: str) -> str:
     return os.environ.get(env_name) or shutil.which(default) or default
 
 
+def _reject_speculative_decoding(extra_args: Sequence[str]) -> None:
+    for argument in extra_args:
+        option = argument.lstrip("-").replace("_", "-")
+        if option.startswith(("speculative", "spec-decode")):
+            raise ValueError(
+                "speculative decoding is incompatible with exact per-call "
+                "thinking-budget enforcement"
+            )
+
+
 def build_sglang_command(
     model_path: str | Path,
     served_model_name: str,
@@ -46,12 +56,13 @@ def build_sglang_command(
     executable: str | None = None,
     extra_args: Sequence[str] = (),
 ) -> list[str]:
-    """Build the supported Qwen3.5 SGLang invocation."""
+    """Build the supported Qwen-family SGLang invocation."""
 
     if not 0 < port < 65_536 or context_length <= 0 or tensor_parallel_size <= 0:
         raise ValueError("invalid port, context length, or tensor parallel size")
     if not 0 < mem_fraction_static <= 1:
         raise ValueError("mem_fraction_static must be in (0, 1]")
+    _reject_speculative_decoding(extra_args)
     return [
         executable or _executable("VALUE_AS_TOOL_SGLANG_BIN", "sglang"),
         "serve",
@@ -76,20 +87,16 @@ def build_sglang_command(
         # Required for the per-call thinking budget: without it SGLang drops the
         # request's custom_logit_processor and thinking runs to the token cap.
         "--enable-custom-logit-processor",
-        # Qwen3.5 hybrid GDN attention is more reliable with this combination
-        # than FlashInfer on current Blackwell deployments.
+        # Qwen hybrid GDN attention is more reliable with this combination
+        # than FlashInfer on current Blackwell deployments.  Do not enable
+        # NEXTN/EAGLE speculative decoding here: SGLang's speculative path does
+        # not reliably apply a per-request custom logit processor to every
+        # drafted token.  That silently defeats the thinking budget above and
+        # lets reasoning consume the complete response allowance.
         "--attention-backend",
         "triton",
         "--mamba-radix-cache-strategy",
         "extra_buffer",
-        "--speculative-algorithm",
-        "NEXTN",
-        "--speculative-num-steps",
-        "3",
-        "--speculative-eagle-topk",
-        "1",
-        "--speculative-num-draft-tokens",
-        "4",
         *extra_args,
     ]
 
@@ -116,6 +123,7 @@ def build_vllm_command(
         raise ValueError("invalid port, context length, or tensor parallel size")
     if not 0 < gpu_memory_utilization <= 1 or max_num_seqs <= 0:
         raise ValueError("invalid GPU utilization or sequence count")
+    _reject_speculative_decoding(extra_args)
     command = [
         executable or _executable("VALUE_AS_TOOL_VLLM_BIN", "vllm"),
         "serve",
@@ -146,8 +154,6 @@ def build_vllm_command(
                 "--tool-call-parser",
                 "qwen3_coder",
                 "--language-model-only",
-                "--speculative-config",
-                '{"method":"mtp","num_speculative_tokens":1}',
             ]
         )
     else:

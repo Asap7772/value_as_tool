@@ -132,6 +132,8 @@ def test_checked_in_configuration_matches_strict_defaults(tmp_path: Path) -> Non
         load_config(None, overrides={"budget.max_candidate_versions": 4})
     with pytest.raises(ValidationError, match="exactly three subagents"):
         load_config(None, overrides={"subagents.max_children": 4})
+    with pytest.raises(ValidationError, match="value-tool limits must be integers"):
+        load_config(None, overrides={"value_tool.max_queries": True})
 
     project = tomllib.loads((repository_root / "pyproject.toml").read_text(encoding="utf-8"))
     extras = project["project"]["optional-dependencies"]
@@ -300,6 +302,30 @@ def test_schedule_has_expected_counts_reference_omission_and_stable_shards() -> 
     )
 
 
+def test_rationale_score_schedule_selects_only_proof_benchmarks() -> None:
+    config = load_config(
+        None,
+        overrides={
+            "evaluation.conditions": [
+                "gvr_rationale_score",
+                "value_tool_rationale_score",
+                "gvr_reference_rationale_score",
+            ],
+            "evaluation.benchmarks": ["imo_proof", "proofbench"],
+            "verifier_feedback.mode": "rationale_score",
+        },
+    )
+    schedule = build_schedule(_benchmark_rows(), config)
+
+    assert len(schedule) == (60 + 145) * 3 * 3
+    assert {item.benchmark for item in schedule} == {"imo_proof", "proofbench"}
+    assert {item.condition for item in schedule} == {
+        Condition.GVR_RATIONALE_SCORE,
+        Condition.VALUE_TOOL_RATIONALE_SCORE,
+        Condition.GVR_REFERENCE_RATIONALE_SCORE,
+    }
+
+
 def test_schedule_is_frozen_and_write_once(tmp_path: Path) -> None:
     config = load_config(None)
     schedule = _small_schedule(config)
@@ -462,7 +488,7 @@ def test_interrupted_requests_invalidate_attempt_with_usage_upper_bound(
     recovered.handle.close()
 
 
-def test_sglang_command_has_exact_qwen_parsers_and_mtp_flags() -> None:
+def test_sglang_command_has_exact_qwen_parsers_without_speculative_decoding() -> None:
     command = build_sglang_command(
         "/models/qwen",
         "Qwen/Qwen3.5-9B",
@@ -501,17 +527,38 @@ def test_sglang_command_has_exact_qwen_parsers_and_mtp_flags() -> None:
         "triton",
         "--mamba-radix-cache-strategy",
         "extra_buffer",
-        "--speculative-algorithm",
-        "NEXTN",
-        "--speculative-num-steps",
-        "3",
-        "--speculative-eagle-topk",
-        "1",
-        "--speculative-num-draft-tokens",
-        "4",
         "--log-level",
         "warning",
     ]
+    assert not any(argument.startswith("--speculative") for argument in command)
+
+
+def test_slurm_launcher_caps_both_gpu_arrays_at_128_by_default() -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    launcher = (repository_root / "scripts" / "submit_slurm.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        "readonly MAX_CONCURRENT_GPUS=${VALUE_AS_TOOL_MAX_CONCURRENT_GPUS:-128}"
+        in launcher
+    )
+    assert '--array="0-$((SOLVE_SHARDS - 1))%${SOLVE_ARRAY_CONCURRENCY}"' in launcher
+    assert '--array="0-$((JUDGE_SHARDS - 1))%${MAX_CONCURRENT_GPUS}"' in launcher
+
+
+def test_slurm_gpu_runner_reserves_and_pins_sglang_nccl_port() -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    runner = (repository_root / "scripts" / "slurm" / "run_gpu.sbatch").read_text(
+        encoding="utf-8"
+    )
+
+    assert "reserve_tcp_port" in runner
+    assert "RESERVED_PORT_FDS" in runner
+    assert "[[ $model_role == solver && $SOLVER_BACKEND == sglang ]]" in runner
+    assert "readonly SGLANG_NCCL_PORT=${RESERVED_PORTS[1]}" in runner
+    assert "--extra-arg=--nccl-port" in runner
+    assert '"--extra-arg=${SGLANG_NCCL_PORT}"' in runner
 
 
 def test_vllm_commands_have_exact_solver_and_judge_parsers() -> None:
@@ -554,8 +601,6 @@ def test_vllm_commands_have_exact_solver_and_judge_parsers() -> None:
         "--tool-call-parser",
         "qwen3_coder",
         "--language-model-only",
-        "--speculative-config",
-        '{"method":"mtp","num_speculative_tokens":1}',
         "--dtype",
         "bfloat16",
     ]

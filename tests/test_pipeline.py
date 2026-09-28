@@ -563,6 +563,16 @@ def test_cli_accepts_canonical_global_config_and_shard_arguments() -> None:
     assert args.command == "solve"
     assert (args.shard_index, args.shard_count) == (2, 8)
 
+    serve_args = build_parser().parse_args(
+        [
+            "serve",
+            "qwen",
+            "--extra-arg=--nccl-port",
+            "--extra-arg=38123",
+        ]
+    )
+    assert serve_args.extra_arg == ["--nccl-port", "38123"]
+
     smoke_args = build_parser().parse_args(
         [
             "--config",
