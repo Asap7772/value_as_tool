@@ -1,9 +1,10 @@
 # Value as Tool
 
 `value-as-tool` is a standalone, token-accounted evaluation harness for
-Qwen3.5-9B on olympiad mathematics.  It compares direct generation with an
-Aletheia-style Generator/Verifier/Reviser loop, an optional fresh-context
-subagent tool, and a reference-assisted verifier ablation.
+Qwen-family models on olympiad mathematics. It compares direct generation with
+Aletheia-style Generator/Verifier/Reviser loops, value-verifier tools,
+fresh-context subagents, reference-assisted ablations, and source-hashed custom
+proof harnesses.
 
 The repository does not import or read `../reasoning_bank` at runtime.  Model,
 dataset, prompt, sampling, and judging revisions needed to reproduce the direct
@@ -35,7 +36,10 @@ verifier at 32,768, and later candidate/subagent/verifier calls share a hard
 98,304-token correction pool that reserves a viable call for each of the three
 configured candidate versions. This allocation leaves enough room for Qwen's
 thinking mode to complete the required verifier tool call while keeping the
-229,376-token trajectory budget unchanged.
+229,376-token trajectory budget unchanged. The SGLang solver deliberately uses
+ordinary decoding rather than NEXTN/EAGLE speculation: in the pinned SGLang
+release, speculative verification can bypass the per-request thinking-budget
+processor and consume the reserved response tokens as hidden reasoning.
 Its verifier returns only a verdict, candidate-local excerpt, short category,
 and a 600-character critique; an exact-copy filter removes long spans found
 only in the reference. This is a bounded leakage heuristic, not a formal
@@ -46,6 +50,46 @@ The published Aletheia artifacts describe the three-way routing but do not
 release the role prompts, orchestration code, attempt limit, or token accounting.
 This project therefore uses the precise term **Aletheia-style**, not an exact
 reproduction of Aletheia.
+
+### Static proof-harness registry
+
+An experiment may select explicit `module:Class` entries under
+`evaluation.harnesses`. The checked-in registry contains the eight existing
+methods (`direct`, `gvr`, `gvr_subagents`, `gvr_reference`, `value_tool`, and
+their three rationale-score variants) plus `cch_plan_work_review`. Each module
+declares whether it is blind or reference-assisted, and its source SHA-256 is
+recorded in the schedule so resumed artifacts cannot silently switch policies.
+The trusted runtime retains token accounting, model access, and checkpointing;
+harness modules control only their orchestration policy.
+
+`cch_plan_work_review` adapts the Plan → Work → fresh Review → bounded Retake
+shape from the Claude Code Harness as a proof-agent design. It does not invoke
+Claude Code or expose Bash, filesystem, or network tools to a trajectory. The
+method is blind: it never receives the benchmark reference proof. It can spend
+16,384 tokens planning, 65,536 on the initial proof, 24,576 on each of three
+reviews, and up to 40,960 and 32,768 on two repairs. An approving review ends
+the trajectory early; the worst-case total remains the shared 229,376-token
+cap.
+
+`experiment_value_tool.yaml` defines a separate paired `direct`/`value_tool`
+experiment. In the latter condition the solver may call
+`query_success_probability` up to three times. Each query gives a fresh-context
+Qwen verifier the original problem and the solver's actual partial trace; the
+query takes no semantic arguments, and any provider-emitted payload is ignored.
+The solver receives only `{"success_probability": p}`. These are model-reported
+estimates, not calibrated probabilities. Solver and verifier generations share
+the same 229,376-token trajectory cap. Per-query estimates and trace hashes are
+stored in each trajectory and exported to `rows.jsonl`; reports also separate
+value-verifier token use.
+
+`experiment_rationale_score.yaml` selects the proof benchmarks only and runs
+three explicitly versioned conditions: `gvr_rationale_score`,
+`value_tool_rationale_score`, and `gvr_reference_rationale_score`. Each verifier
+returns a model-reported success probability plus a concise rationale. GVR
+retains its categorical verdict solely for routing, while the rationale and
+score are passed to the next Generator/Reviser turn. The tool condition returns
+the same two fields to the calling solver. Reference-only copied spans are still
+removed before reference-verifier feedback reaches the solver.
 
 ## Setup
 
@@ -80,12 +124,50 @@ manifest until a full `prepare` has been run.
 ## Commands
 
 ```bash
+value-as-tool harness list
+value-as-tool --config experiment_qwen38_27b_harness.yaml harness validate
 value-as-tool --config experiment.yaml prepare
 value-as-tool --config experiment.yaml solve --shard-index 0 --shard-count 16
 value-as-tool --config experiment.yaml judge --shard-index 0 --shard-count 16
 value-as-tool --config experiment.yaml report
 value-as-tool --config experiment.yaml status
 ```
+
+The value-tool variant can be launched independently with:
+
+```bash
+VALUE_AS_TOOL_SLURM_QOS=h200_rsci_bigjob \
+VALUE_AS_TOOL_SLURM_PARTITION=h200_rsci \
+VALUE_AS_TOOL_SLURM_ACCOUNT=mathsi \
+VALUE_AS_TOOL_MAX_CONCURRENT_GPUS=128 \
+  ./scripts/submit.sh experiment_value_tool.yaml
+```
+
+The nine-method proof-only run uses the pinned `Qwen/Qwen3.8-27B` checkpoint
+for every solver, verifier, reviser, and subagent role, while retaining the
+pinned `openai/gpt-oss-20b` external judge:
+
+```bash
+uv run value-as-tool --config experiment_qwen38_27b_harness.yaml harness validate
+VALUE_AS_TOOL_SLURM_QOS=h200_rsci_bigjob \
+VALUE_AS_TOOL_SLURM_PARTITION=h200_rsci \
+VALUE_AS_TOOL_SLURM_ACCOUNT=mathsi \
+VALUE_AS_TOOL_MAX_CONCURRENT_GPUS=128 \
+  ./scripts/submit.sh experiment_qwen38_27b_harness.yaml
+```
+
+That config evaluates IMO-Proof and ProofBench at seeds 0, 1, and 2: 205
+problems × 9 methods × 3 seeds = 5,535 trajectories. It does not schedule the
+9B model.
+
+The launcher limits aggregate solve and judge allocation to 128 GPUs by
+default and rejects larger values. Set `VALUE_AS_TOOL_MAX_CONCURRENT_GPUS` to a
+value from 1 through 128 for a lower hard cap; tensor-parallel solve tasks count
+all GPUs they reserve. Solve and judge are dependency-ordered, so their GPU
+allocations do not overlap. When multiple tasks share a node, each runner holds
+lock-backed reservations for its
+HTTP port and, for SGLang, its internal `--nccl-port`; this prevents one model
+server's distributed TCPStore from colliding with another server.
 
 To reconstruct only the direct cells in a separate artifact directory, apply
 the same two overrides to every stage, for example:
@@ -111,8 +193,8 @@ conditional on no direct sample reaching the 229,376-token limit.
 
 `value-as-tool all` runs those stages against already-running endpoints.
 `value-as-tool smoke` is an explicit live check that runs one reference-bearing
-proof problem at seed 0 through all four conditions and then judges the four
-outputs; both configured endpoints must already be running. It writes ordinary
+proof problem at seed 0 through every condition in the selected config and then
+judges the outputs; both configured endpoints must already be running. It writes ordinary
 resumable cells, so a subsequent full run safely reuses them. Use
 `--benchmark`, `--problem-id`, or `--seed` to select another scheduled case.
 `value-as-tool serve qwen` and `value-as-tool serve judge` start the pinned local

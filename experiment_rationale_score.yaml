@@ -1,0 +1,87 @@
+schema_version: 1
+
+paths:
+  artifact_root: artifacts/rationale_score_v2
+  asset_root: artifacts/assets
+
+models:
+  solver:
+    name: Qwen/Qwen3.5-9B
+    revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+    base_url: http://127.0.0.1:8000/v1
+    api_key_env: MODEL_API_KEY
+  judge:
+    name: openai/gpt-oss-20b
+    revision: 6cee5e81ee83917806bbde320786a8fb61efebee
+    base_url: http://127.0.0.1:8001/v1
+    api_key_env: LLAMA_API_KEY
+
+datasets:
+  imo_proof:
+    name: lm-provers/IMOProofBench
+    revision: 4b02dfebc3a956682398ce5847d56d0e820a758d
+    split: train
+  proofbench:
+    name: lm-provers/ProofBench
+    revision: c9ef8ca58c1711c4e3f1415755fc1a5286610c61
+    split: train
+  imo_answer:
+    name: Hwilner/imo-answerbench
+    revision: 0258becbd00fc07d34862bc8539e61c8742f0d14
+    split: train
+
+sampling:
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  min_p: 0.0
+  presence_penalty: 1.5
+  repetition_penalty: 1.0
+  enable_thinking: true
+  thinking_content_reserve_tokens: 8192
+
+budget:
+  generated_tokens: 229376
+  context_tokens: 262144
+  context_headroom_tokens: 1024
+  initial_generator_tokens: 98304
+  verifier_tokens: 32768
+  correction_pool_tokens: 98304
+  max_candidate_versions: 3
+  minimum_call_tokens: 1024
+
+subagents:
+  max_children: 3
+  max_depth: 1
+  child_tokens: 16384
+  final_candidate_reserve_tokens: 32768
+  max_context_chars: 4000
+
+value_tool:
+  max_queries: 3
+  verifier_tokens: 32768
+  final_response_reserve_tokens: 32768
+
+verifier_feedback:
+  mode: rationale_score
+
+evaluation:
+  conditions:
+    - gvr_rationale_score
+    - value_tool_rationale_score
+    - gvr_reference_rationale_score
+  benchmarks: [imo_proof, proofbench]
+  seeds: [0, 1, 2]
+  direct_answer_compatibility_seed: 0
+  bootstrap_samples: 10000
+  judge_reasoning_effort: medium
+  judge_output_tokens: 95000
+
+runtime:
+  solver_backend: sglang
+  request_timeout_seconds: 18000
+  max_retries: 3
+  max_concurrency: 16
+  solve_shards: 128
+  judge_shards: 128
+  resume: true
