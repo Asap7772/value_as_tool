@@ -1,0 +1,50 @@
+{
+  "archive_bytes": 666792083,
+  "archive_sha256": "60157023b28e470d0e6fb48e34059ddf5c485a53e52a21080291b06f66e3efbb",
+  "chunk_max_bytes": 90000000,
+  "format": "tar.zst",
+  "parts": [
+    {
+      "bytes": 90000000,
+      "name": "qwen38_27b_harness_v4.tar.zst.part-00",
+      "sha256": "3f185205f52fdd656e6b60cd44859d3148e7f3054d4be12a1eedc90053831fbf"
+    },
+    {
+      "bytes": 90000000,
+      "name": "qwen38_27b_harness_v4.tar.zst.part-01",
+      "sha256": "29e057ea43c24c9f075127e6625af7830c3ea4dde4682eb51e3950b565bfa334"
+    },
+    {
+      "bytes": 90000000,
+      "name": "qwen38_27b_harness_v4.tar.zst.part-02",
+      "sha256": "3ff7f20a716b3e05475820c58a4aa354001cc9e891797ccd0b432eecde7a090c"
+    },
+    {
+      "bytes": 90000000,
+      "name": "qwen38_27b_harness_v4.tar.zst.part-03",
+      "sha256": "d2fe9b78e800614bd0a4753480c22e54ad70f154e2dcf8c265fa800721b34183"
+    },
+    {
+      "bytes": 90000000,
+      "name": "qwen38_27b_harness_v4.tar.zst.part-04",
+      "sha256": "8f0e1a40c5cbc23c1e793ee4198b82e2ab4099e1660741d536add03268ec9341"
+    },
+    {
+      "bytes": 90000000,
+      "name": "qwen38_27b_harness_v4.tar.zst.part-05",
+      "sha256": "763f54db07c0ec461882f991c85330df6f7cfbfa45ad1fd21400a358b1cc9e9a"
+    },
+    {
+      "bytes": 90000000,
+      "name": "qwen38_27b_harness_v4.tar.zst.part-06",
+      "sha256": "4862af6653b78928a5fe67e6c10a2c5f406ed04dc13aaf3c6d36365cf560a59c"
+    },
+    {
+      "bytes": 36792083,
+      "name": "qwen38_27b_harness_v4.tar.zst.part-07",
+      "sha256": "02966d92943d6885d3c2d071afdd8dfdd8ae9efb8aaa5df61b662ac8f3a4a406"
+    }
+  ],
+  "source_file_count": 44941,
+  "source_payload_bytes": 10078848252
+}

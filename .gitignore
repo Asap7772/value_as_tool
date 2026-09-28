@@ -11,6 +11,9 @@ __pycache__/
 .coverage
 dist/
 build/
-artifacts/
+artifacts/*
+!artifacts/README.md
+!artifacts/qwen38_27b_harness_v4.manifest.json
+!artifacts/qwen38_27b_harness_v4.tar.zst.part-*
 *.log
 slurm-*.out
