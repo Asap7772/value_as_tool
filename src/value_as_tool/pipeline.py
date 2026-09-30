@@ -1128,6 +1128,9 @@ def joined_rows(source: StageSource) -> list[dict[str, Any]]:
             "solve_status": "missing",
             "judge_status": "unjudged",
             "generated_tokens": 0,
+            "reasoning_tokens": 0,
+            "prompt_tokens": 0,
+            "length_call_count": 0,
             "total_tokens": 0,
             "usage_exact": False,
             "value_query_count": 0,
@@ -1170,6 +1173,15 @@ def joined_rows(source: StageSource) -> list[dict[str, Any]]:
             row.update(
                 solve_status=str(solve_result.get("status", "failed")),
                 generated_tokens=int(normalized_usage.get("completion_tokens", 0)),
+                reasoning_tokens=int(normalized_usage.get("reasoning_tokens") or 0),
+                prompt_tokens=int(normalized_usage.get("prompt_tokens", 0)),
+                length_call_count=sum(
+                    1
+                    for call in raw_calls
+                    if isinstance(call, Mapping)
+                    and isinstance(call.get("response"), Mapping)
+                    and call["response"].get("finish_reason") == "length"
+                ),
                 total_tokens=int(normalized_usage.get("total_tokens", 0)),
                 usage_exact=bool(solve_result.get("usage_exact", True)),
                 value_query_count=len(value_estimates),
@@ -1232,6 +1244,7 @@ def report(source: StageSource) -> dict[str, Any]:
     result = write_report(
         destination,
         rows,
+        ks=tuple(range(1, len(context.config.evaluation.seeds) + 1)),
         bootstrap_samples=context.config.evaluation.bootstrap_samples,
         expected_seeds=context.config.evaluation.seeds,
         answer_compatibility_seed=(

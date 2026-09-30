@@ -160,7 +160,54 @@ That config evaluates IMO-Proof and ProofBench at seeds 0, 1, and 2: 205
 problems × 9 methods × 3 seeds = 5,535 trajectories. It does not schedule the
 9B model.
 
-The launcher limits aggregate solve and judge allocation to 128 GPUs by
+`experiment_qwen35_9b_harness_large_budget.yaml` runs the same nine methods
+with pinned `Qwen/Qwen3.5-9B` and **eight samples per problem** (seeds 0–7):
+205 problems × 9 methods × 8 seeds = **14,760 trajectories**. It writes to the
+separate `artifacts/qwen35_9b_harness_large_budget_v1` directory. Thinking stays
+enabled, with no forced thinking cutoff. The shared generation ceiling is
+8,388,608 tokens; larger phase, verifier, child, and CCH-stage allowances avoid
+the smaller allocations used in the 27B run. Each request still fits within
+the native 262,144-token context, including its prompt and 1,024-token headroom,
+so native context limits can still truncate a completion.
+
+This run uses 384 solve and judge shards, one GPU per server, and two concurrent
+trajectories per server. The launch splits both stages across
+`g3_scientific-reasoning_high` (up to 128 GPUs) and `g3_core_shared` (up to 64
+GPUs), always with `--segment=1`, for an aggregate cap of 192 GPUs. A 115-cell
+pilot covers every method and benchmark before the controller expands the run.
+Pilot cells are retained for resume; full judging follows solving. The external
+judge remains pinned GPT-OSS-20B at
+medium effort with its existing 95,000-token output cap.
+
+```bash
+uv run value-as-tool --config experiment_qwen35_9b_harness_large_budget.yaml harness validate
+.venv/bin/python scripts/submit_qwen35_large_budget.py launch \
+  --config experiment_qwen35_9b_harness_large_budget.yaml \
+  --run-root artifacts/qwen35_9b_large_budget_launch_001
+```
+
+The dedicated launcher records its immutable snapshot, exact submissions,
+pilot audit, and final completion in the run directory. It verifies and reuses
+the local pinned models and prepared benchmark data; it refuses nonempty output
+directories. Use the snapshot configuration and recorded path overrides for
+status or manual recovery.
+
+To expand an already running pilot immediately, while retaining its active
+work, use the separate scheduler controller:
+
+```bash
+.venv/bin/python scripts/expand_qwen35_large_budget.py \
+  --manifest artifacts/qwen35_9b_large_budget_launch_001/submission.json \
+  --high-cap 212 --shared-cap 64
+```
+
+This overrides the pilot completion gate and permits up to 276 GPUs across the
+two QoS pools. It reserves three slots for existing pilot solve or judge jobs,
+and makes matching full-array tasks wait for their pilot solve jobs. Full
+judging waits for both solve arrays and all pilot judges. The source snapshot,
+experiment settings, and final coverage and budget audit remain unchanged.
+
+The general `scripts/submit_slurm.sh` launcher limits aggregate allocation to 128 GPUs by
 default and rejects larger values. Set `VALUE_AS_TOOL_MAX_CONCURRENT_GPUS` to a
 value from 1 through 128 for a lower hard cap; tensor-parallel solve tasks count
 all GPUs they reserve. Solve and judge are dependency-ordered, so their GPU
@@ -208,14 +255,15 @@ Reports distinguish the legacy direct metric from actual success:
 - proof mean grade is the mean 0–7 judge score, normalized to a percentage;
 - proof success means an exact 7/7 grade;
 - answer success means judged correctness;
-- `pass@k` is computed from the three independent final trajectories;
+- `pass@k` is computed from the configured independent final trajectories,
+  for every `k` up to the sample count (including pass@8 for the eight-seed run);
 - `best-grade@k` is the expected maximum continuous proof grade.
 
 Only the final trajectory output is an evaluation sample; intermediate
 candidates and subagents are diagnostics.  Missing or failed scheduled results
 score zero and make the report explicitly incomplete.  `pass@k` and
 `best-grade@k` are paired with final-attempt and total incurred `cost@k`, since
-three samples can consume three trajectory budgets. Incurred cost includes
+`k` samples can consume `k` trajectory budgets. Incurred cost includes
 invalidated retries and is marked inexact when an interrupted request requires
 an upper bound; external-judge cost remains a separate accounting bucket.
 
