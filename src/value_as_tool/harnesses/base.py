@@ -8,7 +8,7 @@ trusted evaluator.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
@@ -26,7 +26,10 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 
-HarnessAccess = Literal["blind", "reference_assisted"]
+HarnessAccess = Literal[
+    "blind", "reference_assisted", "attempt_assisted", "attempt_and_reference_assisted"
+]
+ATTEMPT_CONDITIONING_MODES = ("solutions", "solution_summary", "thinking_summary")
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,16 +43,30 @@ class HarnessSpec:
     requires_reference: bool = False
     entrypoint: str = ""
     source_sha256: str = ""
+    conditioning_mode: str | None = None
 
     def __post_init__(self) -> None:
         if not self.harness_id or not self.display_name:
             raise ValueError("harness id and display name must be nonempty")
-        if self.access not in ("blind", "reference_assisted"):
+        if self.access not in (
+            "blind", "reference_assisted", "attempt_assisted", "attempt_and_reference_assisted"
+        ):
             raise ValueError(f"unsupported harness access class: {self.access!r}")
-        if self.requires_reference != (self.access == "reference_assisted"):
+        if self.requires_reference != (
+            self.access in {"reference_assisted", "attempt_and_reference_assisted"}
+        ):
             raise ValueError(
                 "requires_reference must agree with the harness access class"
             )
+        if (
+            self.conditioning_mode is not None
+            and self.conditioning_mode not in ATTEMPT_CONDITIONING_MODES
+        ):
+            raise ValueError(f"unsupported conditioning mode: {self.conditioning_mode!r}")
+        if (self.conditioning_mode is not None) != (
+            self.access in {"attempt_assisted", "attempt_and_reference_assisted"}
+        ):
+            raise ValueError("conditioning_mode must agree with the harness access class")
 
 
 class HarnessAbort(RuntimeError):
@@ -81,13 +98,16 @@ class HarnessRuntime:
         self.__orchestrator = orchestrator
         self.__state = state
         request = state.result.request
-        if spec.access == "blind":
+        if not spec.requires_reference:
             safe_metadata = {
                 key: value
                 for key, value in request.metadata.items()
                 if not any(
                     marker in key.casefold()
-                    for marker in ("answer", "grading", "reference", "rubric", "solution")
+                    for marker in (
+                        "answer", "grading", "reference", "rubric", "solution",
+                        "evidence", "conditioning",
+                    )
                 )
             }
             request = request.__class__(
@@ -101,6 +121,9 @@ class HarnessRuntime:
                 solver_prompt=request.solver_prompt,
                 metadata=safe_metadata,
             )
+        # Conditioning is a capability of the trusted verifier paths, never
+        # a general-purpose prompt ingredient exposed to harness generators.
+        request = replace(request, verifier_evidence=None)
         self.__request = request
 
     @property
@@ -320,6 +343,7 @@ def module_source_path(value: type[Any]) -> Path:
 
 
 __all__ = [
+    "ATTEMPT_CONDITIONING_MODES",
     "HarnessAbort",
     "HarnessAccess",
     "HarnessRuntime",

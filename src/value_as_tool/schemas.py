@@ -340,6 +340,7 @@ class TrajectoryRequest:
     reference_proof: str | None = None
     solver_prompt: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    verifier_evidence: Mapping[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> TrajectoryRequest:
@@ -348,10 +349,13 @@ class TrajectoryRequest:
             raise ValueError("request.metadata must be an object")
         reference = value.get("reference_proof")
         solver_prompt = value.get("solver_prompt")
+        verifier_evidence = value.get("verifier_evidence")
         if reference is not None and not isinstance(reference, str):
             raise ValueError("request.reference_proof must be a string or null")
         if solver_prompt is not None and not isinstance(solver_prompt, str):
             raise ValueError("request.solver_prompt must be a string or null")
+        if verifier_evidence is not None and not isinstance(verifier_evidence, Mapping):
+            raise ValueError("request.verifier_evidence must be an object or null")
         return cls(
             benchmark=_required_string(value, "benchmark"),
             problem_id=_required_string(value, "problem_id"),
@@ -370,6 +374,9 @@ class TrajectoryRequest:
             reference_proof=reference,
             solver_prompt=solver_prompt,
             metadata=dict(metadata),
+            verifier_evidence=(
+                dict(verifier_evidence) if verifier_evidence is not None else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -378,6 +385,8 @@ class TrajectoryRequest:
             value.pop("condition", None)
         if self.harness_id is None:
             value.pop("harness_id", None)
+        if self.verifier_evidence is None:
+            value.pop("verifier_evidence", None)
         return value
 
     @property
@@ -708,6 +717,8 @@ class TrajectoryResult:
 
     def to_dict(self) -> dict[str, Any]:
         value = _jsonable(asdict(self))
+        if self.request.verifier_evidence is None:
+            value["request"].pop("verifier_evidence", None)
         for verdict in value.get("verdicts", []):
             if isinstance(verdict, dict) and verdict.get("success_probability") is None:
                 verdict.pop("success_probability", None)

@@ -38,7 +38,9 @@ PROOF_BENCHMARKS = {
 LEGACY_REFERENCE_METHODS = frozenset(
     {"gvr_reference", "gvr_reference_rationale_score"}
 )
-HARNESS_ACCESS_CLASSES = frozenset({"blind", "reference_assisted"})
+HARNESS_ACCESS_CLASSES = frozenset({
+    "blind", "reference_assisted", "attempt_assisted", "attempt_and_reference_assisted"
+})
 
 
 def _plain(value: Any) -> Any:
@@ -132,9 +134,7 @@ def _method_identity(row: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("harness_source_sha256 must be a lowercase SHA-256 digest")
     access = str(access_value or "")
     if access not in HARNESS_ACCESS_CLASSES:
-        raise ValueError(
-            "harness_access must be 'blind' or 'reference_assisted'"
-        )
+        raise ValueError("unsupported harness_access class")
     entrypoint = str(entrypoint_value or "")
     if not entrypoint:
         raise ValueError("harness_entrypoint must not be empty")

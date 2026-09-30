@@ -117,6 +117,14 @@ def load_context(
     if path_overrides:
         runtime_paths = runtime_paths.model_copy(update=path_overrides)
     runtime = identity.model_copy(update={"paths": runtime_paths})
+    if identity.conditioning is not None:
+        resolved_conditioning = {
+            name: str((source.parent / getattr(identity.conditioning, name)).resolve())
+            for name in ("source_artifact_root", "bank_root")
+        }
+        runtime = runtime.model_copy(
+            update={"conditioning": identity.conditioning.model_copy(update=resolved_conditioning)}
+        )
     identity_payload = build_experiment_identity(identity)
     return PipelineContext(
         config_path=source,
@@ -148,6 +156,7 @@ def report_path(source: StageSource) -> Path:
 
 
 def _load_schedule(context: PipelineContext) -> Schedule:
+    _conditioning_manifest(context)
     schedule = load_schedule(schedule_path(context))
     if schedule.config_fingerprint != context.config_fingerprint:
         raise ArtifactMismatchError(
@@ -219,9 +228,7 @@ def preflight(
         checks.append(PreflightCheck("qed_prompts", True, "vendored QED-Nano prompts verified"))
     except Exception as exc:
         checks.append(
-            PreflightCheck(
-                "qed_prompts", False, f"QED prompt verification failed: {exc}"
-            )
+            PreflightCheck("qed_prompts", False, f"QED prompt verification failed: {exc}")
         )
 
     manifest_path = model_manifest_path(context.config)
@@ -281,9 +288,7 @@ def preflight(
                 PreflightCheck("schedule", True, f"schedule verified: {selected_schedule}")
             )
         except Exception as exc:
-            checks.append(
-                PreflightCheck("schedule", False, f"invalid prepared schedule: {exc}")
-            )
+            checks.append(PreflightCheck("schedule", False, f"invalid prepared schedule: {exc}"))
     else:
         checks.append(
             PreflightCheck(
@@ -321,6 +326,7 @@ def prepare(
     """Explicitly materialize pinned assets and the immutable full schedule."""
 
     context = _context(source)
+    conditioning_manifest = _conditioning_manifest(context)
     benchmark_manifest = dict(benchmark_preparer(context.config))
     model_manifest = dict(
         model_preparer(context.config, tokenizer_only=True)
@@ -332,6 +338,7 @@ def prepare(
         benchmarks,
         context.identity_config,
         config_fingerprint=context.config_fingerprint,
+        conditioning_manifest=conditioning_manifest,
     )
     destination = write_schedule(schedule_path(context), schedule)
     return {
@@ -371,12 +378,64 @@ def _method_id(item: ScheduleItem) -> str:
 def _harness_identity(item: ScheduleItem) -> dict[str, Any]:
     if item.harness_id is None:
         return {}
-    return {
+    identity = {
         "harness_id": item.harness_id,
         "harness_entrypoint": item.harness_entrypoint,
         "harness_source_sha256": item.harness_source_sha256,
         "harness_access": item.harness_access,
     }
+    if item.conditioning_mode is not None:
+        identity.update(
+            conditioning_mode=item.conditioning_mode,
+            conditioning_pack_sha256=item.conditioning_pack_sha256,
+        )
+    return identity
+
+
+def _conditioning_manifest(context: PipelineContext) -> Mapping[str, Any] | None:
+    conditioning = context.config.conditioning
+    if conditioning is None:
+        return None
+    if conditioning.manifest_sha256 is None:
+        raise ValueError("freeze the conditioning manifest before preparing evaluation")
+    from .conditioning import load_frozen_manifest
+
+    manifest = load_frozen_manifest(Path(conditioning.bank_root), conditioning.manifest_sha256)
+    if manifest.get("bank_sha256") != conditioning.bank_sha256:
+        raise ArtifactMismatchError("conditioning bank digest differs from configuration")
+    source_seeds = manifest.get("source_seeds")
+    if (
+        not isinstance(source_seeds, list)
+        or any(type(seed) is not int for seed in source_seeds)
+        or sorted(source_seeds) != sorted(conditioning.source_seeds)
+    ):
+        raise ArtifactMismatchError("conditioning source seeds differ from configuration")
+    if set(source_seeds) & set(context.config.evaluation.seeds):
+        raise ArtifactMismatchError("evaluation seeds must be disjoint from conditioning seeds")
+    solver = context.config.models.solver
+    expected_model = {"name": solver.name, "revision": solver.revision}
+    if manifest.get("source_model") != expected_model:
+        raise ArtifactMismatchError("conditioning source model differs from configuration")
+    if (manifest.get("summary_settings") or {}).get("model") != expected_model:
+        raise ArtifactMismatchError("conditioning summary model differs from configuration")
+    return manifest
+
+
+def _verifier_evidence(context: PipelineContext, item: ScheduleItem) -> Mapping[str, Any] | None:
+    if item.conditioning_mode is None:
+        return None
+    conditioning = context.config.conditioning
+    if conditioning is None or not conditioning.manifest_sha256:
+        raise ArtifactMismatchError("conditioned solve requires a frozen manifest")
+    from .conditioning import load_conditioning_pack
+
+    return load_conditioning_pack(
+        Path(conditioning.bank_root),
+        item.benchmark,
+        item.problem_id,
+        item.conditioning_mode,
+        expected_sha256=item.conditioning_pack_sha256,
+    )
 
 
 def _benchmark_item(item: ScheduleItem) -> BenchmarkItem:
@@ -419,18 +478,14 @@ def _orchestrator_config(
         subagent_context_max_chars=config.subagents.max_context_chars,
         value_tool_max_queries=config.value_tool.max_queries,
         value_verifier_cap=config.value_tool.verifier_tokens,
-        value_final_response_reserve_tokens=(
-            config.value_tool.final_response_reserve_tokens
-        ),
+        value_final_response_reserve_tokens=(config.value_tool.final_response_reserve_tokens),
         temperature=config.sampling.temperature,
         top_p=config.sampling.top_p,
         top_k=config.sampling.top_k,
         min_p=config.sampling.min_p,
         presence_penalty=config.sampling.presence_penalty,
         repetition_penalty=config.sampling.repetition_penalty,
-        extra_body={
-            "chat_template_kwargs": {"enable_thinking": config.sampling.enable_thinking}
-        },
+        extra_body={"chat_template_kwargs": {"enable_thinking": config.sampling.enable_thinking}},
         thinking_content_reserve_tokens=config.sampling.thinking_content_reserve_tokens,
         thinking_budget_processor=thinking_processor,
     )
@@ -466,20 +521,23 @@ def _result_matches_item(item: ScheduleItem, result: Mapping[str, Any]) -> None:
             )
     if item.harness_id is not None:
         expected["harness_id"] = item.harness_id
+    if item.conditioning_mode is not None:
+        evidence = request.get("verifier_evidence")
+        if not isinstance(evidence, Mapping) or (
+            evidence.get("mode") != item.conditioning_mode
+            or evidence.get("pack_sha256") != item.conditioning_pack_sha256
+        ):
+            raise ArtifactMismatchError(f"solver evidence mismatch for {item.run_id}")
     for key, value in expected.items():
         if request.get(key) != value:
             raise ArtifactMismatchError(f"solver result {key} mismatch for {item.run_id}")
     if item.harness_id is not None:
         metadata = request.get("metadata")
         if not isinstance(metadata, Mapping):
-            raise ArtifactMismatchError(
-                f"solver result lacks harness metadata for {item.run_id}"
-            )
+            raise ArtifactMismatchError(f"solver result lacks harness metadata for {item.run_id}")
         for key, value in _harness_identity(item).items():
             if result.get(key) != value or metadata.get(key) != value:
-                raise ArtifactMismatchError(
-                    f"solver result {key} mismatch for {item.run_id}"
-                )
+                raise ArtifactMismatchError(f"solver result {key} mismatch for {item.run_id}")
 
 
 async def _solve_one(
@@ -499,10 +557,7 @@ async def _solve_one(
             item.harness_entrypoint,
             source_sha256=item.harness_source_sha256,
         )
-        if (
-            harness.spec.harness_id != item.harness_id
-            or harness.spec.access != item.harness_access
-        ):
+        if harness.spec.harness_id != item.harness_id or harness.spec.access != item.harness_access:
             raise ArtifactMismatchError(
                 f"loaded harness identity does not match schedule item {item.run_id}"
             )
@@ -523,11 +578,12 @@ async def _solve_one(
         handle = claim.handle
         assert handle is not None
         benchmark = _benchmark_item(item)
-        request = replace(item.to_request(), solver_prompt=prompts.solve_prompt(benchmark))
+        request = replace(
+            item.to_request(verifier_evidence=_verifier_evidence(context, item)),
+            solver_prompt=prompts.solve_prompt(benchmark),
+        )
 
-        async def checkpoint(
-            result: TrajectoryResult, attempt_handle: Any = handle
-        ) -> None:
+        async def checkpoint(result: TrajectoryResult, attempt_handle: Any = handle) -> None:
             attempt_handle.save_checkpoint("trajectory", result.to_dict())
 
         orchestrator = AletheiaOrchestrator(
@@ -970,8 +1026,7 @@ def _smoke_cells(
             return tuple(cells[method] for method in required)
     qualifier = f" problem {problem_id!r}" if problem_id is not None else ""
     raise ValueError(
-        f"no reference-bearing {benchmark}{qualifier} has all configured harnesses "
-        f"at seed {seed}"
+        f"no reference-bearing {benchmark}{qualifier} has all configured harnesses at seed {seed}"
     )
 
 
@@ -1032,9 +1087,7 @@ async def smoke(
         judge_result = judge_store.load_result(item.run_id)
         judge_state = judge_store.status(item.run_id)
         judge_status = str(
-            (judge_result or {}).get(
-                "judge_status", (judge_state or {}).get("status", "missing")
-            )
+            (judge_result or {}).get("judge_status", (judge_state or {}).get("status", "missing"))
         )
         if solve_status not in ADJUDICATABLE_TRAJECTORY_STATUSES or judge_status != "completed":
             failures.append(
@@ -1075,9 +1128,7 @@ def _invalidated_usage(store: ArtifactStore, run_id: str) -> dict[str, Any] | No
     for invalidation in records:
         attempt = invalidation.get("attempt")
         if isinstance(attempt, int):
-            events_path = (
-                store.run_dir(run_id) / "attempts" / f"{attempt:06d}" / "events.jsonl"
-            )
+            events_path = store.run_dir(run_id) / "attempts" / f"{attempt:06d}" / "events.jsonl"
             if events_path.exists():
                 for event in read_jsonl(events_path):
                     if event.get("event") != "request_completed":
@@ -1154,8 +1205,7 @@ def joined_rows(source: StageSource) -> list[dict[str, Any]]:
             raw_verdicts = solve_result.get("verdicts", [])
             verifier_assessments = (
                 [dict(value) for value in raw_verdicts if isinstance(value, Mapping)]
-                if isinstance(raw_verdicts, Sequence)
-                and not isinstance(raw_verdicts, (str, bytes))
+                if isinstance(raw_verdicts, Sequence) and not isinstance(raw_verdicts, (str, bytes))
                 else []
             )
             generated_by_role: Counter[str] = Counter()
@@ -1208,9 +1258,7 @@ def joined_rows(source: StageSource) -> list[dict[str, Any]]:
         row["invalidated_solve_usage"] = invalidated_solve
         row["invalidated_judge_usage"] = invalidated_judge
         invalidated_parts = [
-            value
-            for value in (invalidated_solve, invalidated_judge)
-            if value is not None
+            value for value in (invalidated_solve, invalidated_judge) if value is not None
         ]
         if invalidated_parts:
             row["invalidated_usage"] = {
@@ -1247,12 +1295,14 @@ def report(source: StageSource) -> dict[str, Any]:
         ks=tuple(range(1, len(context.config.evaluation.seeds) + 1)),
         bootstrap_samples=context.config.evaluation.bootstrap_samples,
         expected_seeds=context.config.evaluation.seeds,
-        answer_compatibility_seed=(
-            context.config.evaluation.direct_answer_compatibility_seed
-        ),
+        answer_compatibility_seed=(context.config.evaluation.direct_answer_compatibility_seed),
     )
     result["schedule_fingerprint"] = schedule.fingerprint
     result["scheduled_cells"] = len(schedule)
+    if context.config.conditioning is not None:
+        from .conditioning_report import write_conditioning_report
+
+        result["conditioning_analysis"] = write_conditioning_report(context, rows, destination)
     artifacts = result.get("artifacts")
     if isinstance(artifacts, dict):
         artifacts["rows_jsonl"] = "rows.jsonl"
@@ -1316,16 +1366,12 @@ def serve(
         base_url=context.config.models.operational_base_url(model_role),
         log_path=context.artifact_root / "logs" / f"serve-{model_role}.log",
         context_length=(
-            context.config.budget.context_tokens
-            if model_role == "solver"
-            else JUDGE_CONTEXT_TOKENS
+            context.config.budget.context_tokens if model_role == "solver" else JUDGE_CONTEXT_TOKENS
         ),
         tensor_parallel_size=tensor_parallel_size,
         extra_args=tuple(extra_args),
         environment=(
-            {"VLLM_USE_RUST_FRONTEND": "1"}
-            if model_role == "solver" and backend == "vllm"
-            else {}
+            {"VLLM_USE_RUST_FRONTEND": "1"} if model_role == "solver" and backend == "vllm" else {}
         ),
     )
     executor(spec)

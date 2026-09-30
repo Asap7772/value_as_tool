@@ -79,6 +79,14 @@ def build_parser() -> argparse.ArgumentParser:
         stage = commands.add_parser(name, help=f"run a resumable {name} shard")
         stage.add_argument("--shard-index", type=int, default=0)
         stage.add_argument("--shard-count", type=int, default=1)
+    conditioning = commands.add_parser(
+        "conditioning", help="build, summarize, and freeze prior-attempt evidence"
+    )
+    conditioning_commands = conditioning.add_subparsers(dest="conditioning_command", required=True)
+    conditioning_commands.add_parser("build-bank")
+    summary_command = conditioning_commands.add_parser("summarize")
+    summary_command.add_argument("--task-id", required=True)
+    conditioning_commands.add_parser("freeze")
     commands.add_parser("report", help="join schedule cells and write metric reports")
     commands.add_parser("status", help="summarize solve and judge artifact states")
 
@@ -104,9 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     harness_parser = commands.add_parser(
         "harness", help="inspect and validate proof-harness modules"
     )
-    harness_commands = harness_parser.add_subparsers(
-        dest="harness_command", required=True
-    )
+    harness_commands = harness_parser.add_subparsers(dest="harness_command", required=True)
     harness_commands.add_parser("list", help="list the built-in harness registry")
     harness_validate = harness_commands.add_parser(
         "validate",
@@ -133,15 +139,14 @@ def _harness_record(entrypoint: str) -> dict[str, Any]:
         "display_name": spec.display_name,
         "access": spec.access,
         "requires_reference": spec.requires_reference,
+        "conditioning_mode": spec.conditioning_mode,
         "condition": spec.condition.value if spec.condition is not None else None,
         "entrypoint": spec.entrypoint,
         "source_sha256": spec.source_sha256,
     }
 
 
-def _inspect_harnesses(
-    entrypoints: Sequence[str], *, instantiate: bool
-) -> dict[str, Any]:
+def _inspect_harnesses(entrypoints: Sequence[str], *, instantiate: bool) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     seen_ids: dict[str, str] = {}
@@ -208,6 +213,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result["ok"] else 1
 
     context = load_context(config_path, overrides=overrides)
+
+    if args.command == "conditioning":
+        import hashlib
+
+        from .conditioning import build_bank, freeze_bank, summarize_task
+
+        selected = context.config.conditioning
+        if selected is None:
+            parser.error("conditioning commands require a conditioning config section")
+        root = Path(selected.bank_root)
+        if args.conditioning_command == "build-bank":
+            build_bank(
+                Path(selected.source_artifact_root),
+                root,
+                model=context.config.models.solver,
+                source_seeds=selected.source_seeds,
+                config=context.config,
+            )
+            target = root / "bank.json"
+        elif args.conditioning_command == "summarize":
+            _print(asyncio.run(summarize_task(context, args.task_id)))
+            return 0
+        else:
+            freeze_bank(root, expected_bank_sha256=selected.bank_sha256)
+            target = root / "manifest.json"
+        _print({"path": str(target), "sha256": hashlib.sha256(target.read_bytes()).hexdigest()})
+        return 0
 
     if args.command == "preflight":
         result = preflight(

@@ -42,6 +42,8 @@ class ScheduleItem:
     harness_entrypoint: str | None = None
     harness_source_sha256: str | None = None
     harness_access: str | None = None
+    conditioning_mode: str | None = None
+    conditioning_pack_sha256: str | None = None
     reference_proof: str | None = None
     golden_answer: str | None = None
     rubric: Any = None
@@ -59,18 +61,33 @@ class ScheduleItem:
                 raise ValueError("harness schedule identity must be complete")
             assert self.harness_source_sha256 is not None
             if len(self.harness_source_sha256) != 64 or any(
-                character not in "0123456789abcdef"
-                for character in self.harness_source_sha256
+                character not in "0123456789abcdef" for character in self.harness_source_sha256
             ):
                 raise ValueError("harness source hash must be a lowercase SHA-256 digest")
-            if self.harness_access not in {"blind", "reference_assisted"}:
+            if self.harness_access not in {
+                "blind",
+                "reference_assisted",
+                "attempt_assisted",
+                "attempt_and_reference_assisted",
+            }:
                 raise ValueError("unsupported harness access class")
         elif self.condition is None:
             raise ValueError("a schedule item requires a harness or legacy condition")
+        if self.conditioning_mode is not None:
+            if self.conditioning_mode not in {"solutions", "solution_summary", "thinking_summary"}:
+                raise ValueError("unsupported conditioning mode")
+            digest = self.conditioning_pack_sha256 or ""
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError("conditioned schedules require a pack SHA-256")
+        elif self.conditioning_pack_sha256 is not None:
+            raise ValueError("conditioning pack requires a mode")
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["condition"] = self.condition.value if self.condition is not None else None
+        if self.conditioning_mode is None:
+            value.pop("conditioning_mode")
+            value.pop("conditioning_pack_sha256")
         # Keep legacy schema-v1 bytes and fingerprints stable.  Harness fields
         # are an additive extension emitted only for harness-native schedules.
         if self.harness_id is None:
@@ -91,26 +108,26 @@ class ScheduleItem:
             benchmark=str(value["benchmark"]),
             problem_id=str(value["problem_id"]),
             condition=(
-                Condition(str(value["condition"]))
-                if value.get("condition") is not None
-                else None
+                Condition(str(value["condition"])) if value.get("condition") is not None else None
             ),
             seed=int(value["seed"]),
             problem=str(value["problem"]),
             problem_fingerprint=str(value["problem_fingerprint"]),
             harness_id=_optional_string(value.get("harness_id")),
             harness_entrypoint=_optional_string(value.get("harness_entrypoint")),
-            harness_source_sha256=_optional_string(
-                value.get("harness_source_sha256")
-            ),
+            harness_source_sha256=_optional_string(value.get("harness_source_sha256")),
             harness_access=_optional_string(value.get("harness_access")),
+            conditioning_mode=_optional_string(value.get("conditioning_mode")),
+            conditioning_pack_sha256=_optional_string(value.get("conditioning_pack_sha256")),
             reference_proof=_optional_string(value.get("reference_proof")),
             golden_answer=_optional_string(value.get("golden_answer")),
             rubric=value.get("rubric"),
             metadata=dict(value.get("metadata") or {}),
         )
 
-    def to_request(self) -> TrajectoryRequest:
+    def to_request(
+        self, *, verifier_evidence: Mapping[str, Any] | None = None
+    ) -> TrajectoryRequest:
         metadata = {
             **dict(self.metadata),
             "schedule_ordinal": self.ordinal,
@@ -126,6 +143,11 @@ class ScheduleItem:
                 harness_source_sha256=self.harness_source_sha256,
                 harness_access=self.harness_access,
             )
+        if self.conditioning_mode is not None:
+            metadata.update(
+                conditioning_mode=self.conditioning_mode,
+                conditioning_pack_sha256=self.conditioning_pack_sha256,
+            )
         return TrajectoryRequest(
             benchmark=self.benchmark,
             problem_id=self.problem_id,
@@ -135,6 +157,7 @@ class ScheduleItem:
             harness_id=self.harness_id,
             reference_proof=self.reference_proof,
             metadata=metadata,
+            verifier_evidence=verifier_evidence,
         )
 
 
@@ -302,6 +325,7 @@ def build_schedule(
     harnesses: Iterable[str] | None = None,
     seeds: Iterable[int] | None = None,
     config_fingerprint: str | None = None,
+    conditioning_manifest: Mapping[str, Any] | None = None,
 ) -> Schedule:
     """Build the immutable full evaluation matrix.
 
@@ -310,8 +334,8 @@ def build_schedule(
     any item without a reference proof.
     """
 
-    selected_fingerprint = config.fingerprint if config_fingerprint is None else str(
-        config_fingerprint
+    selected_fingerprint = (
+        config.fingerprint if config_fingerprint is None else str(config_fingerprint)
     )
     if not selected_fingerprint:
         raise ValueError("config_fingerprint must not be empty")
@@ -322,9 +346,7 @@ def build_schedule(
         conditions is None and configured_harnesses is not None
     )
     selected_harnesses = (
-        _resolve_harnesses(
-            harnesses if harnesses is not None else configured_harnesses or ()
-        )
+        _resolve_harnesses(harnesses if harnesses is not None else configured_harnesses or ())
         if use_harnesses
         else ()
     )
@@ -333,15 +355,19 @@ def build_schedule(
         if use_harnesses
         else tuple(
             _condition(value)
-            for value in (
-                config.evaluation.conditions if conditions is None else conditions
-            )
+            for value in (config.evaluation.conditions if conditions is None else conditions)
         )
     )
     selected_seeds = tuple(config.evaluation.seeds if seeds is None else seeds)
+    if any(spec.conditioning_mode is not None for spec in selected_harnesses):
+        if (
+            config.conditioning is None
+            or not config.conditioning.manifest_sha256
+            or conditioning_manifest is None
+        ):
+            raise ValueError("conditioned evaluation requires a frozen conditioning manifest")
     if not use_harnesses and (
-        not selected_conditions
-        or len(set(selected_conditions)) != len(selected_conditions)
+        not selected_conditions or len(set(selected_conditions)) != len(selected_conditions)
     ):
         raise ValueError("conditions must be non-empty and unique")
     if (
@@ -350,6 +376,10 @@ def build_schedule(
         or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in selected_seeds)
     ):
         raise ValueError("seeds must be non-empty unique integers")
+    if config.conditioning is not None and set(selected_seeds) & set(
+        config.conditioning.source_seeds
+    ):
+        raise ValueError("evaluation seeds must be disjoint from conditioning seeds")
 
     records: list[ScheduleItem] = []
     seen_identities: set[tuple[str, str, str, str, int]] = set()
@@ -377,7 +407,25 @@ def build_schedule(
                         Condition.GVR_REFERENCE_RATIONALE_SCORE,
                     }
                 if requires_reference and not problem.supports_reference_verification:
+                    if isinstance(method, HarnessSpec) and method.conditioning_mode:
+                        raise ValueError(
+                            f"conditioned gold arm requires reference: {problem.problem_id}"
+                        )
                     continue
+                conditioning_mode = (
+                    method.conditioning_mode if isinstance(method, HarnessSpec) else None
+                )
+                pack_sha256 = None
+                if conditioning_mode is not None:
+                    assert conditioning_manifest is not None
+                    evidence_problem = conditioning_manifest["problems"][problem.benchmark][
+                        problem.problem_id
+                    ]
+                    if evidence_problem["problem_fingerprint"] != problem.fingerprint:
+                        raise ValueError(
+                            f"conditioning problem fingerprint mismatch: {problem.problem_id}"
+                        )
+                    pack_sha256 = evidence_problem["packs"][conditioning_mode]["sha256"]
                 for seed in selected_seeds:
                     identity = (
                         problem.benchmark,
@@ -403,11 +451,14 @@ def build_schedule(
                             harness_source_sha256=method.source_sha256,
                             harness_access=method.access,
                             condition=(
-                                method.condition.value
-                                if method.condition is not None
-                                else None
+                                method.condition.value if method.condition is not None else None
                             ),
                         )
+                        if conditioning_mode is not None:
+                            run_material.update(
+                                conditioning_mode=conditioning_mode,
+                                conditioning_pack_sha256=pack_sha256,
+                            )
                     else:
                         # Preserve the legacy run-ID material exactly.
                         run_material["condition"] = condition.value
@@ -423,26 +474,20 @@ def build_schedule(
                             problem=problem.problem,
                             problem_fingerprint=problem.fingerprint,
                             harness_id=(
-                                method.harness_id
-                                if isinstance(method, HarnessSpec)
-                                else None
+                                method.harness_id if isinstance(method, HarnessSpec) else None
                             ),
                             harness_entrypoint=(
-                                method.entrypoint
-                                if isinstance(method, HarnessSpec)
-                                else None
+                                method.entrypoint if isinstance(method, HarnessSpec) else None
                             ),
                             harness_source_sha256=(
-                                method.source_sha256
-                                if isinstance(method, HarnessSpec)
-                                else None
+                                method.source_sha256 if isinstance(method, HarnessSpec) else None
                             ),
                             harness_access=(
-                                method.access
-                                if isinstance(method, HarnessSpec)
-                                else None
+                                method.access if isinstance(method, HarnessSpec) else None
                             ),
                             reference_proof=problem.reference_proof,
+                            conditioning_mode=conditioning_mode,
+                            conditioning_pack_sha256=pack_sha256,
                             golden_answer=problem.golden_answer,
                             rubric=problem.rubric,
                             metadata=problem.metadata,
@@ -489,9 +534,7 @@ def write_schedule(path: str | Path, schedule: Schedule) -> Path:
         if target.exists():
             existing = load_schedule(target)
             if existing.fingerprint != schedule.fingerprint:
-                raise ArtifactMismatchError(
-                    f"refusing to replace a different schedule: {target}"
-                )
+                raise ArtifactMismatchError(f"refusing to replace a different schedule: {target}")
             return target
         atomic_write_json(target, record)
     return target

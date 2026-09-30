@@ -8,7 +8,9 @@ import inspect
 from dataclasses import replace
 from typing import Any
 
+from value_as_tool.harnesses.attempt_conditioned import ATTEMPT_CONDITIONED_HARNESSES
 from value_as_tool.harnesses.base import (
+    ATTEMPT_CONDITIONING_MODES,
     HarnessRuntime,
     HarnessSpec,
     ProofHarness,
@@ -80,6 +82,8 @@ def builtin_entrypoint_for_condition(condition: str) -> str:
 
 
 __all__ = [
+    "ATTEMPT_CONDITIONED_HARNESSES",
+    "ATTEMPT_CONDITIONING_MODES",
     "BUILTIN_HARNESSES",
     "HarnessRuntime",
     "HarnessSpec",

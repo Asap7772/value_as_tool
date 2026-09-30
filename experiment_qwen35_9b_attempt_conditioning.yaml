@@ -1,0 +1,125 @@
+# Shared attempt evidence; freeze summary manifest before evaluation.
+schema_version: 1
+paths:
+  artifact_root: /storage/home/anikaitsingh/value_as_tool/artifacts/qwen35_9b_attempt_conditioning_v1
+  asset_root: /storage/home/anikaitsingh/value_as_tool/artifacts/assets
+models:
+  solver:
+    name: Qwen/Qwen3.5-9B
+    revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+    base_url: http://127.0.0.1:8000/v1
+    api_key_env: MODEL_API_KEY
+  judge:
+    name: openai/gpt-oss-20b
+    revision: 6cee5e81ee83917806bbde320786a8fb61efebee
+    base_url: http://127.0.0.1:8001/v1
+    api_key_env: LLAMA_API_KEY
+datasets:
+  imo_proof:
+    name: lm-provers/IMOProofBench
+    revision: 4b02dfebc3a956682398ce5847d56d0e820a758d
+    split: train
+  proofbench:
+    name: lm-provers/ProofBench
+    revision: c9ef8ca58c1711c4e3f1415755fc1a5286610c61
+    split: train
+  imo_answer:
+    name: Hwilner/imo-answerbench
+    revision: 0258becbd00fc07d34862bc8539e61c8742f0d14
+    split: train
+sampling:
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  min_p: 0.0
+  presence_penalty: 1.5
+  repetition_penalty: 1.0
+  enable_thinking: true
+  thinking_content_reserve_tokens: 0
+budget:
+  generated_tokens: 8388608
+  context_tokens: 262144
+  context_headroom_tokens: 1024
+  initial_generator_tokens: 2621440
+  verifier_tokens: 524288
+  correction_pool_tokens: 5242880
+  cch_stage_tokens: 262144
+  max_candidate_versions: 3
+  minimum_call_tokens: 1024
+subagents:
+  max_children: 3
+  max_depth: 1
+  child_tokens: 262144
+  final_candidate_reserve_tokens: 262144
+  max_context_chars: 4000
+value_tool:
+  max_queries: 3
+  verifier_tokens: 262144
+  final_response_reserve_tokens: 262144
+evaluation:
+  conditions: []
+  harnesses:
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solutions_gvr_legacy_no_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solutions_gvr_legacy_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solutions_gvr_rationale_no_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solutions_gvr_rationale_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solutions_value_tool_legacy_no_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solutions_value_tool_legacy_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solutions_value_tool_rationale_no_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solutions_value_tool_rationale_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solution_summary_gvr_legacy_no_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solution_summary_gvr_legacy_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solution_summary_gvr_rationale_no_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solution_summary_gvr_rationale_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solution_summary_value_tool_legacy_no_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solution_summary_value_tool_legacy_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solution_summary_value_tool_rationale_no_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_solution_summary_value_tool_rationale_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_thinking_summary_gvr_legacy_no_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_thinking_summary_gvr_legacy_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_thinking_summary_gvr_rationale_no_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_thinking_summary_gvr_rationale_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_thinking_summary_value_tool_legacy_no_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_thinking_summary_value_tool_legacy_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_thinking_summary_value_tool_rationale_no_gold
+  - value_as_tool.harnesses.attempt_conditioned:attempt_thinking_summary_value_tool_rationale_gold
+  benchmarks:
+  - imo_proof
+  - proofbench
+  seeds:
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  direct_answer_compatibility_seed: 8
+  bootstrap_samples: 50000
+  judge_reasoning_effort: medium
+  judge_output_tokens: 95000
+runtime:
+  solver_backend: sglang
+  solver_tensor_parallel_size: 1
+  request_timeout_seconds: 18000
+  max_retries: 3
+  max_concurrency: 2
+  solve_shards: 1
+  judge_shards: 1
+  resume: true
+conditioning:
+  source_artifact_root: /storage/home/anikaitsingh/value_as_tool/artifacts/qwen35_9b_harness_large_budget_v1
+  bank_root: /storage/home/anikaitsingh/value_as_tool/artifacts/qwen35_9b_attempt_conditioning_v1/conditioning
+  source_seeds:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  map_target_tokens: 2048
+  summary_target_tokens: 8192
+  max_summary_attempts: 3

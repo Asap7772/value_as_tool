@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, StrictInt, field_validator, model_validator
 
 Condition = Literal[
     "direct",
@@ -199,9 +199,7 @@ class SamplingConfig(FrozenModel):
         if self.thinking_content_reserve_tokens < 0:
             raise ValueError("thinking_content_reserve_tokens must be non-negative")
         if self.thinking_content_reserve_tokens and not self.enable_thinking:
-            raise ValueError(
-                "thinking_content_reserve_tokens requires enable_thinking"
-            )
+            raise ValueError("thinking_content_reserve_tokens requires enable_thinking")
         return self
 
     def openai_kwargs(self) -> dict[str, Any]:
@@ -348,9 +346,7 @@ class EvaluationConfig(FrozenModel):
 
     @field_validator("harnesses")
     @classmethod
-    def validate_harness_entrypoints(
-        cls, value: tuple[str, ...] | None
-    ) -> tuple[str, ...] | None:
+    def validate_harness_entrypoints(cls, value: tuple[str, ...] | None) -> tuple[str, ...] | None:
         if value is None:
             return None
         if not value or len(value) != len(set(value)):
@@ -407,13 +403,55 @@ class RuntimeConfig(FrozenModel):
             raise ValueError("request timeout must be positive")
         if self.max_retries < 0:
             raise ValueError("max_retries must be non-negative")
-        if min(
-            self.solver_tensor_parallel_size,
-            self.max_concurrency,
-            self.solve_shards,
-            self.judge_shards,
-        ) <= 0:
+        if (
+            min(
+                self.solver_tensor_parallel_size,
+                self.max_concurrency,
+                self.solve_shards,
+                self.judge_shards,
+            )
+            <= 0
+        ):
             raise ValueError("concurrency and shard counts must be positive")
+        return self
+
+
+class ConditioningConfig(FrozenModel):
+    """Immutable prior-attempt evidence and shared summary settings."""
+
+    source_artifact_root: str
+    bank_root: str
+    bank_sha256: str | None = None
+    manifest_sha256: str | None = None
+    source_seeds: tuple[StrictInt, ...] = tuple(range(8))
+    map_target_tokens: StrictInt = 2_048
+    summary_target_tokens: StrictInt = 8_192
+    max_summary_attempts: StrictInt = 3
+
+    @field_validator("source_artifact_root", "bank_root")
+    @classmethod
+    def nonempty_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("conditioning paths must not be empty")
+        return value
+
+    @field_validator("bank_sha256", "manifest_sha256")
+    @classmethod
+    def digest(cls, value: str | None) -> str | None:
+        if value is not None and (
+            len(value) != 64 or any(c not in "0123456789abcdef" for c in value)
+        ):
+            raise ValueError("conditioning digest must be a lowercase SHA-256")
+        return value
+
+    @model_validator(mode="after")
+    def validate_conditioning(self) -> ConditioningConfig:
+        if not self.source_seeds or len(set(self.source_seeds)) != len(self.source_seeds):
+            raise ValueError("conditioning source seeds must be nonempty and unique")
+        if min(self.map_target_tokens, self.summary_target_tokens, self.max_summary_attempts) <= 0:
+            raise ValueError("conditioning summary limits must be positive")
+        if self.manifest_sha256 is not None and self.bank_sha256 is None:
+            raise ValueError("frozen conditioning requires the source bank digest")
         return self
 
 
@@ -429,9 +467,14 @@ class ExperimentConfig(FrozenModel):
     verifier_feedback: VerifierFeedbackConfig = VerifierFeedbackConfig()
     evaluation: EvaluationConfig = EvaluationConfig()
     runtime: RuntimeConfig = RuntimeConfig()
+    conditioning: ConditioningConfig | None = None
 
     @model_validator(mode="after")
     def validate_cross_section_constraints(self) -> ExperimentConfig:
+        if self.conditioning is not None and set(self.evaluation.seeds) & set(
+            self.conditioning.source_seeds
+        ):
+            raise ValueError("evaluation seeds must be disjoint from conditioning seeds")
         rationale_conditions = {
             "gvr_rationale_score",
             "value_tool_rationale_score",
@@ -456,8 +499,7 @@ class ExperimentConfig(FrozenModel):
                     )
             elif selected_conditions & rationale_conditions:
                 raise ValueError(
-                    "rationale-score conditions require "
-                    "verifier_feedback.mode=rationale_score"
+                    "rationale-score conditions require verifier_feedback.mode=rationale_score"
                 )
         subagent_need = (
             self.subagents.max_children * self.subagents.child_tokens
@@ -485,6 +527,8 @@ class ExperimentConfig(FrozenModel):
 
     def to_dict(self) -> dict[str, Any]:
         value = self.model_dump(mode="json")
+        if value.get("conditioning") is None:
+            value.pop("conditioning")
         if value["budget"].get("cch_stage_tokens") is None:
             # Preserve config identities for experiments using legacy CCH caps.
             value["budget"].pop("cch_stage_tokens")
