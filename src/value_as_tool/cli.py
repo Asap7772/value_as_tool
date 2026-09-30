@@ -79,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
         stage = commands.add_parser(name, help=f"run a resumable {name} shard")
         stage.add_argument("--shard-index", type=int, default=0)
         stage.add_argument("--shard-count", type=int, default=1)
+        stage.add_argument("--run-id", dest="run_ids", action="append")
     conditioning = commands.add_parser(
         "conditioning", help="build, summarize, and freeze prior-attempt evidence"
     )
@@ -259,6 +260,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     context,
                     shard_index=args.shard_index,
                     shard_count=args.shard_count,
+                    run_ids=args.run_ids,
                 )
             )
         )
@@ -270,6 +272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     context,
                     shard_index=args.shard_index,
                     shard_count=args.shard_count,
+                    run_ids=args.run_ids,
                 )
             )
         )

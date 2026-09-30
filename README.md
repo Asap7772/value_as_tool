@@ -91,6 +91,87 @@ score are passed to the next Generator/Reviser turn. The tool condition returns
 the same two fields to the calling solver. Reference-only copied spans are still
 removed before reference-verifier feedback reaches the solver.
 
+### Attempt-conditioned verification: 24 arms
+
+`experiment_qwen35_9b_attempt_conditioning.yaml` crosses four factors:
+
+| Factor | Variants |
+| --- | --- |
+| Prior-attempt evidence | Full solutions and labels; solution summaries and labels; solution-and-thinking summaries and labels |
+| Interaction | GVR; solver-controlled value tool |
+| Feedback | Legacy; rationale and success probability |
+| Reference access | Prior attempts alone; prior attempts plus the benchmark reference solution |
+
+The `legacy` suffix means the existing feedback protocol: GVR returns its
+verdict and bounded critique; the value tool returns only a probability.
+`rationale` adds the rationale-and-score protocol. This factor does not disable
+Qwen's thinking mode. Only verifier calls receive the attempt evidence and,
+for `gold` arms, the reference solution. Generator/Reviser turns receive the
+verifier's filtered feedback.
+
+The default reuses Direct final responses from Qwen3.5-9B seeds 0–7 in
+`artifacts/qwen35_9b_harness_large_budget_v1`. A completed external judge grade
+of 7/7 labels an attempt successful; other valid grades label it unsuccessful.
+Failed source solves and missing or invalid labels are recorded as exclusions.
+Problems with only successful or only unsuccessful attempts stay in the bank.
+The same pinned Qwen3.5-9B model produces both summary forms, using resumable
+map/reduce tasks with 2,048-token map and 8,192-token final summary targets.
+Long material is split and summarized recursively; full-solution packs are
+never silently shortened to fit a verifier call.
+
+Evaluation uses fresh seeds 8–15 on both proof benchmarks: 205 problems ×
+24 arms × 8 seeds = 39,360 trajectories. Each trajectory has the configured
+8,388,608-token shared generation cap and 262,144-token context limit.
+Source-attempt, preprocessing, evaluation, and external-judge costs are kept
+separate so reused evidence is not counted as fresh generation in each arm.
+
+Build and pin the bank before preparing a launch. Run the build command with a
+working copy of the experiment YAML, then set that file's
+`conditioning.bank_sha256` to the returned `sha256` value:
+
+```bash
+cp experiment_qwen35_9b_attempt_conditioning.yaml experiment.attempt-run.yaml
+uv run value-as-tool --config experiment.attempt-run.yaml conditioning build-bank
+```
+
+The following dry run creates a source snapshot, copies the pinned local model
+manifest, and prepares the preprocessing queue. It queries scheduler capacity
+and prints commands without submitting jobs or making model requests:
+
+```bash
+uv run python scripts/submit_attempt_conditioning.py launch \
+  --config experiment.attempt-run.yaml \
+  --control-root artifacts/attempt-launch --dry-run
+```
+
+Launch the prepared manifest and inspect its progress with:
+
+```bash
+uv run python scripts/submit_attempt_conditioning.py launch \
+  --manifest artifacts/attempt-launch/submission.json --submit
+uv run python scripts/submit_attempt_conditioning.py status \
+  --manifest artifacts/attempt-launch/submission.json
+```
+
+The controller runs Qwen summarization first, freezes all evidence packs, writes
+`experiment.frozen.yaml` with the manifest digest, and only then creates the
+evaluation schedule. It gates the full run on 48 pilot trajectories: all arms
+on one problem per benchmark at seed 8. The default pilot problems have median
+Direct token cost; `--pilot-problem BENCHMARK=PROBLEM` selects explicit problems
+during launch preparation. Workers use one GPU and two concurrent requests,
+with current-stage admission capped at 212 high-QoS and 64 shared-QoS GPUs after
+accounting for other jobs owned by the same user.
+
+Reusing the same submission manifest preserves completed work; repeating
+`launch --manifest ... --submit` does not create a second controller. Slurm
+requeues and abandoned worker claims resume from durable checkpoints. A stopped
+controller whose manifest remains `running` can be resumed with
+`supervise --manifest ...` in the prepared source environment. Failed pilots,
+failed preprocessing, changed pinned inputs, and ambiguous submissions stop
+the controller with a recorded reason; inspect that reason before recovery.
+The final controller stage writes the reports and a complete coverage/context
+audit. Model correctness is separate from execution completion.
+
 ## Setup
 
 ```bash

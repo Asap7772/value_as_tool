@@ -193,12 +193,18 @@ PY
 done
 [[ $server_ready == 1 ]] || { echo "model server startup timed out: $SERVER_LOG" >&2; exit 1; }
 
-runtime_stage_args=("${STAGE_ARGS[@]}")
-if [[ -n ${SLURM_ARRAY_TASK_ID:-} ]]; then
-  runtime_stage_args+=(--shard-index "$SLURM_ARRAY_TASK_ID")
+if [[ -n ${VALUE_AS_TOOL_ATTEMPT_MANIFEST:-} ]]; then
+  "$PYTHON_BIN" "${REPO_ROOT}/scripts/attempt_conditioning_worker.py" \
+    --config "$EXPERIMENT_CONFIG" --manifest "$VALUE_AS_TOOL_ATTEMPT_MANIFEST" \
+    --stage "${VALUE_AS_TOOL_ATTEMPT_STAGE:?}" --queue "${VALUE_AS_TOOL_ATTEMPT_QUEUE:?}" &
+else
+  runtime_stage_args=("${STAGE_ARGS[@]}")
+  if [[ -n ${SLURM_ARRAY_TASK_ID:-} ]]; then
+    runtime_stage_args+=(--shard-index "$SLURM_ARRAY_TASK_ID")
+  fi
+  "$PYTHON_BIN" -m value_as_tool --config "$EXPERIMENT_CONFIG" \
+    "$EXPERIMENT_STAGE" "${runtime_stage_args[@]}" &
 fi
-"$PYTHON_BIN" -m value_as_tool --config "$EXPERIMENT_CONFIG" \
-  "$EXPERIMENT_STAGE" "${runtime_stage_args[@]}" &
 child_pid=$!
 set +e
 wait "$child_pid"
