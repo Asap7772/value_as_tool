@@ -165,6 +165,24 @@ def _request(
     )
 
 
+def _large_budget_config() -> OrchestratorConfig:
+    return _config(
+        total_generated_tokens=8_388_608,
+        context_tokens=262_144,
+        context_headroom_tokens=1_024,
+        initial_generator_cap=2_621_440,
+        verifier_cap=524_288,
+        correction_pool=5_242_880,
+        minimum_call_tokens=1_024,
+        subagent_cap=262_144,
+        final_candidate_reserve_tokens=262_144,
+        value_verifier_cap=262_144,
+        value_final_response_reserve_tokens=262_144,
+        thinking_content_reserve_tokens=0,
+        thinking_budget_processor=QWEN3_THINKING_BUDGET_PROCESSOR,
+    )
+
+
 class ScriptedClient:
     def __init__(self, *responses: ChatCompletion | BaseException) -> None:
         self.responses = list(responses)
@@ -1247,6 +1265,81 @@ async def test_corrections_share_a_hard_pool_and_reserve_every_cycle() -> None:
     assert correction_spend <= 50
 
 
+@pytest.mark.asyncio
+async def test_large_budget_allows_every_gvr_cycle_and_verifier_retry() -> None:
+    def verdict(outcome: str) -> ChatCompletion:
+        return _completion(
+            tool_calls=_verdict(outcome).message.tool_calls,
+            completion_tokens=100_000,
+        )
+
+    client = ScriptedClient(
+        _completion("Candidate one.", completion_tokens=100_000),
+        _completion("Invalid verdict.", completion_tokens=100_000),
+        verdict("minor_fix"),
+        _completion("Candidate two.", completion_tokens=100_000),
+        verdict("critical_flaw"),
+        _completion("Candidate three.", completion_tokens=100_000),
+        verdict("correct"),
+    )
+    config = _large_budget_config()
+    result = await AletheiaOrchestrator(
+        client, config, count_messages=lambda messages, tools: 2_048
+    ).run(_request(Condition.GVR))
+
+    assert result.status is TrajectoryStatus.ACCEPTED
+    assert [candidate.role for candidate in result.candidates] == [
+        Role.GENERATOR, Role.REVISER, Role.GENERATOR,
+    ]
+    assert result.usage.completion_tokens == 700_000 > config.context_tokens
+    assert result.budget["spent_generated_tokens"] == 700_000
+    assert result.budget["remaining_generated_tokens"] == 8_388_608 - 700_000
+    assert len(result.calls) == 7
+    assert all(call.max_tokens == 259_072 for call in result.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "condition", [Condition.VALUE_TOOL, Condition.VALUE_TOOL_RATIONALE_SCORE]
+)
+async def test_large_budget_allows_all_value_queries_without_thinking_caps(
+    condition: Condition,
+) -> None:
+    responses: list[ChatCompletion] = []
+    for index in range(3):
+        probability: dict[str, Any] = {"success_probability": 0.5}
+        if condition is Condition.VALUE_TOOL_RATIONALE_SCORE:
+            probability["rationale"] = "A lemma still needs a proof."
+        responses.extend([
+            _completion(
+                reasoning=f"Partial derivation {index}.",
+                tool_calls=[_tool_call("query_success_probability", {}, f"query-{index}")],
+                completion_tokens=100_000,
+            ),
+            _completion(
+                tool_calls=[_tool_call("submit_probability", probability, f"score-{index}")],
+                completion_tokens=100_000,
+            ),
+        ])
+    responses.append(_completion("Final proof.", completion_tokens=100_000))
+    client = ScriptedClient(*responses)
+    config = _large_budget_config()
+    result = await AletheiaOrchestrator(
+        client, config, count_messages=lambda messages, tools: 2_048
+    ).run(_request(condition))
+
+    assert result.status is TrajectoryStatus.COMPLETED
+    assert len(result.value_estimates) == 3
+    assert result.usage.completion_tokens == 700_000 > config.context_tokens
+    assert len(client.calls) == 7
+    assert client.calls[-1][1]["tools"] is None
+    for _, kwargs in client.calls:
+        assert kwargs["max_tokens"] == 259_072
+        assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
+        assert "custom_logit_processor" not in kwargs["extra_body"]
+        assert "custom_params" not in kwargs["extra_body"]
+
+
 @pytest.mark.parametrize("outcome", ["minor_fix", "critical_flaw"])
 @pytest.mark.asyncio
 async def test_answer_corrections_preserve_qed_boxed_output_contract(outcome: str) -> None:
@@ -1389,6 +1482,47 @@ async def test_subagents_have_fresh_context_parallel_budget_fanout_and_no_depth(
     assert result.budget["spent_generated_tokens"] == sum(
         call.usage.completion_tokens for call in result.calls if call.usage is not None
     )
+
+
+@pytest.mark.asyncio
+async def test_large_budget_parallel_children_keep_native_context_allowances() -> None:
+    client = ParallelSubagentClient()
+    config = _large_budget_config()
+    result = await AletheiaOrchestrator(
+        client, config, count_messages=lambda messages, tools: 2_048
+    ).run(_request(Condition.GVR_SUBAGENTS))
+
+    assert result.status is TrajectoryStatus.ACCEPTED
+    assert len(result.subagents) == 3
+    assert client.maximum_child_active == 3
+    assert all(call.max_tokens == 259_072 for call in result.calls)
+    assert sum(call.max_tokens for call in result.calls if call.role is Role.SUBAGENT) > (
+        config.context_tokens
+    )
+    assert result.budget["spent_generated_tokens"] == 12
+    assert result.budget["reserved_generated_tokens"] == 0
+
+
+@pytest.mark.parametrize("headroom", [160, 161])
+def test_context_headroom_must_leave_room_even_with_large_trajectory_budget(
+    headroom: int,
+) -> None:
+    with pytest.raises(ValueError, match="context_headroom_tokens must be smaller"):
+        _config(total_generated_tokens=1_000_000, context_headroom_tokens=headroom)
+
+
+@pytest.mark.parametrize("stage_tokens", [True, 0, -1, 1.5, "16"])
+def test_runtime_rejects_invalid_cch_stage_allowance(stage_tokens: Any) -> None:
+    with pytest.raises(ValueError, match="cch_stage_tokens must be a positive integer"):
+        _config(cch_stage_tokens=stage_tokens)
+
+
+def test_runtime_cch_allowance_reserves_seven_usable_stages() -> None:
+    assert _config(cch_stage_tokens=17).cch_stage_tokens == 17
+    with pytest.raises(ValueError, match="seven CCH stage allowances"):
+        _config(cch_stage_tokens=18)
+    with pytest.raises(ValueError, match="smaller than minimum_call_tokens"):
+        _config(cch_stage_tokens=1, minimum_call_tokens=2)
 
 
 @pytest.mark.asyncio

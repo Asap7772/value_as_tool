@@ -227,22 +227,40 @@ class BudgetConfig(FrozenModel):
     initial_generator_tokens: int = 98_304
     verifier_tokens: int = 32_768
     correction_pool_tokens: int = 98_304
+    cch_stage_tokens: int | None = None
     max_candidate_versions: int = 3
     minimum_call_tokens: int = 1_024
+
+    @field_validator("cch_stage_tokens", mode="before")
+    @classmethod
+    def validate_cch_stage_tokens(cls, value: Any) -> int | None:
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            raise ValueError("cch_stage_tokens must be a positive integer or null")
+        return value
 
     @model_validator(mode="after")
     def validate_budgets(self) -> BudgetConfig:
         values = self.model_dump()
+        values.pop("cch_stage_tokens")
         if any(isinstance(value, bool) or value <= 0 for value in values.values()):
             raise ValueError("all token and cycle budgets must be positive integers")
-        if self.generated_tokens + self.context_headroom_tokens > self.context_tokens:
-            raise ValueError("generated-token budget and context headroom exceed context length")
+        # The shared ledger spans multiple requests; only an individual request
+        # must fit within the model's context window.
+        if self.context_headroom_tokens >= self.context_tokens:
+            raise ValueError("context_headroom_tokens must be smaller than context_tokens")
+        if self.cch_stage_tokens is not None:
+            if self.cch_stage_tokens < self.minimum_call_tokens:
+                raise ValueError("cch_stage_tokens is smaller than minimum_call_tokens")
+            if 7 * self.cch_stage_tokens > self.generated_tokens:
+                raise ValueError(
+                    "seven CCH stage allowances exceed the shared generated-token budget"
+                )
         if self.max_candidate_versions != 3:
             raise ValueError("the fixed protocol requires exactly three candidate versions")
         reserved = (
-            self.initial_generator_tokens
-            + self.verifier_tokens
-            + self.correction_pool_tokens
+            self.initial_generator_tokens + self.verifier_tokens + self.correction_pool_tokens
         )
         if reserved > self.generated_tokens:
             raise ValueError("role caps exceed the shared generated-token budget")
@@ -467,6 +485,9 @@ class ExperimentConfig(FrozenModel):
 
     def to_dict(self) -> dict[str, Any]:
         value = self.model_dump(mode="json")
+        if value["budget"].get("cch_stage_tokens") is None:
+            # Preserve config identities for experiments using legacy CCH caps.
+            value["budget"].pop("cch_stage_tokens")
         evaluation = value.get("evaluation")
         if isinstance(evaluation, dict) and evaluation.get("harnesses") is None:
             # Preserve condition-only experiment identities created before the

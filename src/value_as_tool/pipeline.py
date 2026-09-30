@@ -410,6 +410,7 @@ def _orchestrator_config(
         initial_generator_cap=config.budget.initial_generator_tokens,
         verifier_cap=config.budget.verifier_tokens,
         correction_pool=config.budget.correction_pool_tokens,
+        cch_stage_tokens=config.budget.cch_stage_tokens,
         minimum_call_tokens=config.budget.minimum_call_tokens,
         max_cycles=config.budget.max_candidate_versions,
         subagent_cap=config.subagents.child_tokens,

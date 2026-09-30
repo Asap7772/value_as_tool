@@ -161,6 +161,49 @@ def test_operational_endpoint_overrides_do_not_change_config_identity() -> None:
     assert config.models.solver.base_url == "http://127.0.0.1:8000/v1"
 
 
+def test_optional_cch_budget_preserves_legacy_config_identity() -> None:
+    config = load_config(None)
+    assert config.budget.cch_stage_tokens is None
+    assert "cch_stage_tokens" not in config.to_dict()["budget"]
+    # Captured before the optional stage allowance was introduced.
+    assert config.fingerprint == (
+        "1f2eac2f816e04009f8e8cb0a93394e4e0fb1c3c7bc49a6844c5cab14ed295a8"
+    )
+    explicit_null = load_config(None, overrides={"budget.cch_stage_tokens": None})
+    assert explicit_null.fingerprint == config.fingerprint
+    configured = load_config(None, overrides={"budget.cch_stage_tokens": 32_768})
+    assert configured.to_dict()["budget"]["cch_stage_tokens"] == 32_768
+    assert configured.fingerprint != config.fingerprint
+
+
+def test_shared_budget_can_exceed_context_without_loosening_role_constraints() -> None:
+    config = load_config(None, overrides={"budget.generated_tokens": 8_388_608})
+    assert config.budget.generated_tokens > config.budget.context_tokens
+    with pytest.raises(ValidationError, match="role caps exceed"):
+        load_config(None, overrides={"budget.initial_generator_tokens": 229_376})
+    with pytest.raises(ValidationError, match="correction pool cannot fit"):
+        load_config(None, overrides={"budget.correction_pool_tokens": 32_768})
+
+
+@pytest.mark.parametrize("headroom", [262_144, 262_145])
+def test_configuration_rejects_headroom_that_consumes_context(headroom: int) -> None:
+    with pytest.raises(ValidationError, match="context_headroom_tokens must be smaller"):
+        load_config(None, overrides={"budget.context_headroom_tokens": headroom})
+
+
+@pytest.mark.parametrize("stage_tokens", [True, 0, -1, 1.5, "32768"])
+def test_configuration_rejects_invalid_cch_stage_allowance(stage_tokens: Any) -> None:
+    with pytest.raises(ValidationError, match="cch_stage_tokens must be a positive integer"):
+        load_config(None, overrides={"budget.cch_stage_tokens": stage_tokens})
+
+
+def test_configuration_cch_allowance_reserves_seven_usable_stages() -> None:
+    with pytest.raises(ValidationError, match="seven CCH stage allowances"):
+        load_config(None, overrides={"budget.cch_stage_tokens": 32_769})
+    with pytest.raises(ValidationError, match="smaller than minimum_call_tokens"):
+        load_config(None, overrides={"budget.cch_stage_tokens": 1_023})
+
+
 def test_package_source_hash_is_path_independent_and_content_bound(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"

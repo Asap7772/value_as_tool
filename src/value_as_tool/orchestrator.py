@@ -386,6 +386,7 @@ class OrchestratorConfig:
     initial_generator_cap: int = 98_304
     verifier_cap: int = 32_768
     correction_pool: int = 98_304
+    cch_stage_tokens: int | None = None
     minimum_call_tokens: int = 1_024
     max_cycles: int = 3
     subagent_cap: int = 16_384
@@ -476,10 +477,17 @@ class OrchestratorConfig:
             )
         if self.context_headroom_tokens >= self.context_tokens:
             raise ValueError("context_headroom_tokens must be smaller than context_tokens")
-        if self.total_generated_tokens + self.context_headroom_tokens > self.context_tokens:
-            raise ValueError(
-                "total_generated_tokens plus context headroom exceeds the context window"
-            )
+        if self.cch_stage_tokens is not None:
+            if (
+                isinstance(self.cch_stage_tokens, bool)
+                or not isinstance(self.cch_stage_tokens, int)
+                or self.cch_stage_tokens <= 0
+            ):
+                raise ValueError("cch_stage_tokens must be a positive integer or None")
+            if self.cch_stage_tokens < self.minimum_call_tokens:
+                raise ValueError("cch_stage_tokens is smaller than minimum_call_tokens")
+            if 7 * self.cch_stage_tokens > self.total_generated_tokens:
+                raise ValueError("seven CCH stage allowances exceed total_generated_tokens")
         if self.max_cycles > 3:
             raise ValueError("the Aletheia-style protocol permits at most three cycles")
         if self.max_subagents > 3:

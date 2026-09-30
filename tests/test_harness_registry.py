@@ -8,6 +8,7 @@ import json
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -154,10 +155,10 @@ def _cch_request(**overrides: Any) -> TrajectoryRequest:
     return TrajectoryRequest(**values)
 
 
-def _cch_orchestrator(client: FakeChatClient) -> AletheiaOrchestrator:
+def _cch_orchestrator(client: FakeChatClient, **overrides: Any) -> AletheiaOrchestrator:
     return AletheiaOrchestrator(
         client,
-        OrchestratorConfig(model="Qwen/Qwen3.8-27B"),
+        OrchestratorConfig(model="Qwen/Qwen3.8-27B", **overrides),
     )
 
 
@@ -424,7 +425,10 @@ async def test_cch_accepts_usable_plan_truncated_before_optional_metadata() -> N
 
 
 @pytest.mark.asyncio
-async def test_cch_two_repairs_end_at_cycle_limit_with_exact_stage_caps() -> None:
+@pytest.mark.parametrize("stage_tokens", [None, 262_144])
+async def test_cch_two_repairs_preserve_stage_allowances_and_resume(
+    stage_tokens: int | None,
+) -> None:
     client = FakeChatClient(
         _plan(),
         _completion("Initial proof."),
@@ -450,7 +454,53 @@ async def test_cch_two_repairs_end_at_cycle_limit_with_exact_stage_caps() -> Non
         ),
     )
 
-    result = await _cch_orchestrator(client).run(
+    expected_caps = (
+        [stage_tokens] * 7
+        if stage_tokens is not None
+        else [
+            PLAN_CAP,
+            INITIAL_PROOF_CAP,
+            REVIEW_CAP,
+            FIRST_REPAIR_CAP,
+            REVIEW_CAP,
+            SECOND_REPAIR_CAP,
+            REVIEW_CAP,
+        ]
+    )
+    # Charge substantial usage so cumulative spending, reservation release,
+    # and checkpoint replay exercise the shared ledger across all stages.
+    client.responses = [
+        replace(
+            response,
+            usage=TokenUsage(
+                prompt_tokens=2,
+                completion_tokens=min(cap, 100_000),
+                total_tokens=2 + min(cap, 100_000),
+                reasoning_tokens=min(cap, 100_000) - 1,
+            ),
+        )
+        for response, cap in zip(client.responses, expected_caps, strict=True)
+    ]
+    resume_responses = copy.deepcopy(client.responses[-2:])
+    snapshots = []
+    requested_budgets = []
+
+    class RecordingOrchestrator(AletheiaOrchestrator):
+        async def _call(self, *args: Any, **kwargs: Any) -> tuple[ChatCompletion, int]:
+            requested_budgets.append((kwargs["cap"], kwargs["keep"]))
+            return await super()._call(*args, **kwargs)
+
+    config = OrchestratorConfig(
+        cch_stage_tokens=stage_tokens,
+        total_generated_tokens=8_388_608 if stage_tokens is not None else 229_376,
+    )
+    orchestrator = RecordingOrchestrator(
+        client,
+        config,
+        checkpoint=lambda snapshot: snapshots.append(copy.deepcopy(snapshot)),
+        count_messages=lambda messages, tools: 2,
+    )
+    result = await orchestrator.run(
         _cch_request(),
         harness=load_harness(CCH_ENTRYPOINT),
     )
@@ -466,16 +516,20 @@ async def test_cch_two_repairs_end_at_cycle_limit_with_exact_stage_caps() -> Non
         "cch.work.2",
         "cch.review.2",
     ]
-    assert [call.max_tokens for call in result.calls] == [
-        PLAN_CAP,
-        INITIAL_PROOF_CAP,
-        REVIEW_CAP,
-        FIRST_REPAIR_CAP,
-        REVIEW_CAP,
-        SECOND_REPAIR_CAP,
-        REVIEW_CAP,
+    assert requested_budgets == [
+        (cap, sum(expected_caps[index + 1 :]))
+        for index, cap in enumerate(expected_caps)
     ]
-    assert sum(call.max_tokens for call in result.calls) == 229_376
+    context_cap = config.context_tokens - config.context_headroom_tokens - 2
+    assert [call.max_tokens for call in result.calls] == [
+        min(cap, context_cap) for cap in expected_caps
+    ]
+    assert result.usage.completion_tokens == sum(min(cap, 100_000) for cap in expected_caps)
+    assert result.budget["reserved_generated_tokens"] == 0
+    if stage_tokens is not None:
+        assert result.usage.completion_tokens > config.context_tokens
+    else:
+        assert sum(call.max_tokens for call in result.calls) == 229_376
     assert [candidate.cycle for candidate in result.candidates] == [0, 1, 2]
     assert [verdict.verdict for verdict in result.verdicts] == [
         Verdict.MINOR_FIX,
@@ -485,22 +539,51 @@ async def test_cch_two_repairs_end_at_cycle_limit_with_exact_stage_caps() -> Non
     assert [transition.action for transition in result.transitions].count("retake") == 2
     assert result.transitions[-1].action == "retake_limit"
 
+    checkpoint = next(
+        snapshot
+        for snapshot in snapshots
+        if len(snapshot.calls) == 5 and len(snapshot.verdicts) == 2
+    )
+    replay_client = FakeChatClient(*resume_responses)
+    replayed = await AletheiaOrchestrator(
+        replay_client,
+        config,
+        count_messages=lambda messages, tools: 2,
+    ).run(_cch_request(), resume=checkpoint, harness=load_harness(CCH_ENTRYPOINT))
+
+    assert len(replay_client.calls) == 2
+    assert replayed.status is result.status
+    assert replayed.final_output == result.final_output
+    assert replayed.usage == result.usage
+    assert replayed.budget == result.budget
+    assert replayed.calls == result.calls
+    assert replayed.candidates == result.candidates
+    assert replayed.verdicts == result.verdicts
+    assert replayed.transitions == result.transitions
+
 
 @pytest.mark.asyncio
-async def test_cch_completed_calls_replay_without_redispatch() -> None:
+@pytest.mark.parametrize("stage_tokens", [None, 262_144])
+async def test_cch_completed_calls_replay_without_redispatch(stage_tokens: int | None) -> None:
     first_client = FakeChatClient(
         _plan(),
         _completion("Replayable proof."),
         _review("approve", severity="none", probability=0.88),
     )
     harness = load_harness(CCH_ENTRYPOINT)
-    first = await _cch_orchestrator(first_client).run(_cch_request(), harness=harness)
+    options = {
+        "cch_stage_tokens": stage_tokens,
+        "total_generated_tokens": 8_388_608 if stage_tokens is not None else 229_376,
+    }
+    first = await _cch_orchestrator(first_client, **options).run(
+        _cch_request(), harness=harness
+    )
     checkpoint = copy.deepcopy(first)
     checkpoint.status = TrajectoryStatus.RUNNING
     checkpoint.final_output = None
 
     replay_client = FakeChatClient()
-    replayed = await _cch_orchestrator(replay_client).run(
+    replayed = await _cch_orchestrator(replay_client, **options).run(
         _cch_request(),
         resume=checkpoint,
         harness=load_harness(CCH_ENTRYPOINT, source_sha256=harness.spec.source_sha256),

@@ -301,6 +301,21 @@ class AgentHarness:
 
     async def run(self, runtime: HarnessRuntime) -> None:
         problem = runtime.request.solver_prompt or runtime.request.problem
+        stage_tokens = runtime.cch_stage_tokens
+        stage_caps = (
+            (stage_tokens,) * 7
+            if stage_tokens is not None
+            else (
+                PLAN_CAP,
+                INITIAL_PROOF_CAP,
+                REVIEW_CAP,
+                FIRST_REPAIR_CAP,
+                REVIEW_CAP,
+                SECOND_REPAIR_CAP,
+                REVIEW_CAP,
+            )
+        )
+        stage_keeps = tuple(sum(stage_caps[index + 1 :]) for index in range(7))
         try:
             plan_completion, _ = await runtime.call(
                 role=Role.PLANNER,
@@ -310,8 +325,8 @@ class AgentHarness:
                     {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
                     {"role": "user", "content": problem},
                 ),
-                cap=PLAN_CAP,
-                keep=212_992,
+                cap=stage_caps[0],
+                keep=stage_keeps[0],
                 seed=runtime.stable_seed("cch.plan"),
                 tools=(SUBMIT_PLAN_TOOL,),
                 tool_choice=_forced_tool("submit_plan"),
@@ -332,8 +347,8 @@ class AgentHarness:
                     "content": f"Problem:\n{problem}\n\nApproved plan:\n{plan}",
                 },
             ),
-            cap=INITIAL_PROOF_CAP,
-            keep=147_456,
+            cap=stage_caps[1],
+            keep=stage_keeps[1],
             seed=runtime.stable_seed("cch.work.0"),
         )
         try:
@@ -349,9 +364,8 @@ class AgentHarness:
         )
         await runtime.transition(0, "plan", "work", "review")
 
-        repair_caps = (FIRST_REPAIR_CAP, SECOND_REPAIR_CAP)
-        repair_keeps = (81_920, 24_576)
         for cycle in range(3):
+            review_stage = 2 + 2 * cycle
             review_completion, review_index = await runtime.call(
                 role=Role.REVIEWER,
                 cycle=cycle,
@@ -363,8 +377,8 @@ class AgentHarness:
                         "content": f"Problem:\n{problem}\n\nCandidate proof:\n{proof}",
                     },
                 ),
-                cap=REVIEW_CAP,
-                keep=(122_880, 57_344, 0)[cycle],
+                cap=stage_caps[review_stage],
+                keep=stage_keeps[review_stage],
                 seed=runtime.stable_seed(f"cch.review.{cycle}"),
                 tools=(SUBMIT_REVIEW_TOOL,),
                 tool_choice=_forced_tool("submit_review"),
@@ -410,8 +424,8 @@ class AgentHarness:
                         ),
                     },
                 ),
-                cap=repair_caps[cycle],
-                keep=repair_keeps[cycle],
+                cap=stage_caps[review_stage + 1],
+                keep=stage_keeps[review_stage + 1],
                 seed=runtime.stable_seed(f"cch.work.{repair_cycle}"),
             )
             try:

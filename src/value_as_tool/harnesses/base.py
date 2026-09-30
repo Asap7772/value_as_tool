@@ -112,6 +112,12 @@ class HarnessRuntime:
         return int(self.__orchestrator.config.minimum_call_tokens)
 
     @property
+    def cch_stage_tokens(self) -> int | None:
+        """Optional allowance for each stage of the plan/work/review harness."""
+
+        return self.__orchestrator.config.cch_stage_tokens
+
+    @property
     def remaining_generated_tokens(self) -> int:
         return int(self.__state.budget.remaining_generated_tokens)
 
