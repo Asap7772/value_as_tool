@@ -1,6 +1,6 @@
 # Branched GVR trees on ArXivMath: status and what's left
 
-Last updated 2026-10-02.
+Last updated 2026-10-02 (harness v2 re-pilot running).
 
 ## Where things stand
 
@@ -45,6 +45,7 @@ Last updated 2026-10-02.
 | Baseline collection | `qwen35_9b_gvr_tree_launch_20260930T191640Z`: `submission.json`, `pilot-report.json`, `completion.json` | `qwen35_9b_gvr_tree_arxivmath_v1`, with the export in `export/` |
 | Joint pilot | `qwen35_9b_gvr_replan_joint_launch_20261001T214715Z`: `pilot-report.json`, `pilot-comparison.json` | `qwen35_9b_gvr_replan_joint_arxivmath_v1` |
 | Independent pilot | `qwen35_9b_gvr_replan_independent_launch_20261001T214715Z`: `pilot-report.json` | `qwen35_9b_gvr_replan_independent_arxivmath_v1` |
+| Joint re-pilot (harness v2, running) | `qwen35_9b_gvr_replan_joint_v2_launch_20261002T124031Z` | `qwen35_9b_gvr_replan_joint_arxivmath_v2` |
 
 **Public Hugging Face repos:**
 - **Tree explorer.** Space: https://huggingface.co/spaces/asingh15/value-as-tool-gvr-tree-explorer. Data: https://huggingface.co/datasets/asingh15/value-as-tool-gvr-trees, pinned to revision `c1c7b17f`. It shows the baseline trees.
@@ -96,15 +97,20 @@ Last updated 2026-10-02.
 - **Hiding the current solution is where exploration happens.** Such plans fix 3–4% of wrong parents (under 1% when the solution is shown), and they also break more.
 - **The model's own probabilities are uninformative.** Verifier and planner probabilities average 0.83–0.97 against about 31% accuracy, with AUROC 0.48–0.56.
 - **Gate failures.** The independent pilot passed its health gate. The joint pilot failed one check: 46 of 1,200 branches (3.8%) got no plan, because the model sometimes leaves one plan's `success_probability` out of the 16-field tool call.
+  - **Cause.** SGLang enforces a tool's parameter schema only for `strict` tools, so "required" fields are advisory. The model most often ended the call right after plan 4's show flag (`plan_4_success_probability` was missing in 48 of 61 bad calls), and once wrote the fields as prose inside a brief.
+  - **Fix (harness v2), without constrained decoding:** the planner prompt names all fields in order, each plan's show flag and probability now come before the brief, and a plan without a valid probability still runs (probability recorded as `null`).
 
 ## What's left
 
 ### 1. Decide the next collection (blocked on you)
 
-**Recommended:** the joint planner, with the fix below, if the goal is diverse actions and states.
+**Recommended:** the joint planner (harness v2) if the goal is diverse actions and states.
 
-1. **Fix the joint failure.** In `gvr_replan.py` (`parse_plan_arguments`), treat a missing or invalid `success_probability` as `None` and still execute the plan. Keep requiring a brief and a show flag. Update `tests/test_gvr_replan_harness.py`. This changes the harness source hash, so a full run gets new run IDs; the pilot stays a pilot.
-2. **Optional re-pilot.** A 30-tree re-pilot, about 15 GPU-hours, would confirm that planner failures drop to about 0.
+1. **Done: fix the joint failure.** Harness v2 (described under Gate failures above) has a more explicit planner prompt, short fields before the brief, and runs plans without a probability. Editing the harness changed its source hash, so v2 has new run IDs.
+2. **In progress: re-pilot.** The joint v2 re-pilot runs on the same 30 problems (launch `qwen35_9b_gvr_replan_joint_v2_launch_20261002T124031Z`). When it finishes:
+   - run `pilot-report` and `compare_gvr_tree_variants.py` with the baseline, joint v1 and joint v2 as arms;
+   - check that field omissions and planner failures are near zero;
+   - check that diversity matches v1.
 3. **Full run.** `launch` → you write `approve-full.json` in the launch's control root → `full --lanes 8` → finalize/export. Estimated cost: about 2.0B tokens (about 400 GPU-hours). Trees take about 1 hour each, because the planner waits for all four verifiers.
 
 **If the goal is instead contrast between ✓ and ✗ within states,** neither variant moves that much. Options:
