@@ -493,6 +493,7 @@ def pilot_report(args: argparse.Namespace) -> dict[str, Any]:
         and gate.get("planner_failure_share", 0.0) <= GATE["planner_failure_share"]
     )
     mean_tokens = statistics.fmean(tokens) if tokens else 0.0
+    probabilities = [plan["p"] for plan in planned if plan["p"] is not None]
     report = {
         "generated_at": datetime.now(UTC).isoformat(),
         "pilot_trees": len(manifest["pilot_run_ids"]),
@@ -535,7 +536,12 @@ def pilot_report(args: argparse.Namespace) -> dict[str, Any]:
             "planned_branches": len(planned),
             "recovered_share": round(statistics.fmean(p["recovered"] for p in planned), 4),
             "show_current_solution_share": round(statistics.fmean(p["show"] for p in planned), 4),
-            "mean_success_probability": round(statistics.fmean(p["p"] for p in planned), 4),
+            "missing_probability_share": round(
+                statistics.fmean(p["p"] is None for p in planned), 4
+            ),
+            "mean_success_probability": round(statistics.fmean(probabilities), 4)
+            if probabilities
+            else None,
         }
         if planned
         else None,

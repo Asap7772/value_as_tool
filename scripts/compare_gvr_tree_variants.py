@@ -174,7 +174,9 @@ def tree_metrics(
         "plans": [
             (r["success_probability"], r["node_judge_correct"])
             for r in plans
-            if r["valid"] and r["node_judge_correct"] is not None
+            if r["valid"]
+            and r["success_probability"] is not None
+            and r["node_judge_correct"] is not None
         ],
         "status": tree["status"],
         "failures": tree.get("failures", {}),

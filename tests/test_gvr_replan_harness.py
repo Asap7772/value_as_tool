@@ -519,10 +519,18 @@ async def test_joint_partial_plans_run_and_a_dead_planner_ends_the_tree() -> Non
     client = TreeClient(request, partial)
     result = await _run(JOINT, client, request)
     assert result.status is TrajectoryStatus.CYCLE_LIMIT
-    assert {(3, 0), (3, 2)} <= set(_tree(result)) and not {(3, 1), (3, 3)} & set(_tree(result))
+    # An invalid probability is recorded as missing and the plan still runs; a plan
+    # without a show flag cannot run.
+    assert {(3, 0), (3, 1), (3, 2)} <= set(_tree(result)) and (3, 3) not in _tree(result)
     assert "r02.plan.recovery" not in _sent(client)
     failed = [t for t in result.transitions if t.action == "failed" and t.source == "planner"]
-    assert {t.detail.split(":")[0] for t in failed} == {"branch_1", "branch_3"}
+    assert {t.detail.split(":")[0] for t in failed} == {"branch_3"}
+    plans = {
+        t.target: json.loads(t.detail)
+        for t in result.transitions
+        if t.action == "plan" and t.cycle == 2
+    }
+    assert plans["branch_1"]["p"] is None and plans["branch_0"]["p"] == 0.2
 
     def dead(label: str, messages: Sequence[Mapping[str, Any]]) -> Any:
         if label in {"r03.plan", "r03.plan.recovery"}:
@@ -697,7 +705,7 @@ def test_plan_parser_tolerates_qwen_quirks_and_rejects_bad_fields() -> None:
             },
             1,
         )
-        assert not plan.valid and "success_probability" in (plan.error or "")
+        assert plan.valid and plan.success_probability is None
 
     (long,) = parse_plan_arguments(
         {
@@ -727,3 +735,60 @@ def test_both_harnesses_are_registered_and_the_baseline_harness_is_unchanged() -
     assert {JOINT, INDEPENDENT} <= set(DATA_COLLECTION_HARNESSES)
     branched = Path(__file__).resolve().parents[1] / "src/value_as_tool/harnesses/gvr_branched.py"
     assert hashlib.sha256(branched.read_bytes()).hexdigest() == BRANCHED_SHA256
+
+
+@both
+@pytest.mark.asyncio
+async def test_a_plan_without_a_probability_still_runs(entrypoint: str) -> None:
+    def policy(label: str, messages: Sequence[Mapping[str, Any]]) -> Any:
+        response = default_policy(label, messages)
+        if label in {"r02.plan", "r02.b3.plan"}:
+            arguments = json.loads(response.message.tool_calls[0].arguments)
+            key = (
+                "plan_4_success_probability"
+                if label == "r02.plan"
+                else "plan_1_success_probability"
+            )
+            del arguments[key]
+            return _tool("submit_plans", arguments)
+        return response
+
+    request = _request(entrypoint)
+    client = TreeClient(request, policy)
+    result = await _run(entrypoint, client, request)
+    assert result.status is TrajectoryStatus.CYCLE_LIMIT
+    assert len(result.candidates) == 1 + ROUNDS * BRANCHES
+    assert not any(
+        label.startswith("r02.") and label.endswith(".recovery") for label in _sent(client)
+    )
+    plan = next(
+        json.loads(t.detail)
+        for t in result.transitions
+        if t.action == "plan" and t.cycle == 2 and t.target == "branch_3"
+    )
+    assert plan["p"] is None and plan["recovered"] is False
+
+
+def test_plan_fields_put_the_brief_last_and_the_prompts_name_every_field() -> None:
+    from value_as_tool.harnesses.gvr_replan import (
+        INDEPENDENT_PLANNER_SUFFIX,
+        JOINT_PLANNER_SUFFIX,
+        plan_tool,
+    )
+
+    properties = list(plan_tool(BRANCHES)["function"]["parameters"]["properties"])
+    for slot in range(1, BRANCHES + 1):
+        start = properties.index(f"plan_{slot}_title")
+        assert properties[start : start + 4] == [
+            f"plan_{slot}_title",
+            f"plan_{slot}_show_current_solution",
+            f"plan_{slot}_success_probability",
+            f"plan_{slot}_brief",
+        ]
+    assert properties[-1] == f"plan_{BRANCHES}_brief"
+    joint = " ".join(JOINT_PLANNER_SUFFIX.split())
+    independent = " ".join(INDEPENDENT_PLANNER_SUFFIX.split())
+    assert "fill all sixteen fields" in joint and "fill all four fields" in independent
+    for field in ("show_current_solution", "success_probability", "brief"):
+        assert f"plan_i_{field}" in joint and f"plan_1_{field}" in independent
+    assert "never write the flag or the probability inside" in joint

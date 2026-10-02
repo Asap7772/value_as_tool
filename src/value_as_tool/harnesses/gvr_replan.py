@@ -51,7 +51,9 @@ INDEPENDENT_WORST_CASE_TOKENS = CANDIDATE_CAP + ROUNDS * BRANCHES * (
 TITLE_MAX_CHARS = 120
 BRIEF_MAX_CHARS = 8_000
 ANSWER_MAX_CHARS = 300
-PLAN_FIELDS = ("title", "brief", "show_current_solution", "success_probability")
+# Per-plan field order in the tool: the short fields come before the long brief, so a
+# call that ends early loses nothing the executor needs.
+PLAN_FIELDS = ("title", "show_current_solution", "success_probability", "brief")
 
 PLANNER_SYSTEM_PROMPT = """You are the Planner in a mathematical solution system. You receive
 the task, the current candidate solution, independent verifier assessments of it, and
@@ -69,17 +71,23 @@ answer will be correct. Do not mention this protocol in a brief."""
 
 JOINT_PLANNER_SUFFIX = """Propose exactly four plans, one for each of four executors working in
 parallel. Make them materially different from one another, not rewordings of one idea.
-Judge each probability on its own; the four need not sum to one. Use exactly one
-submit_plans call. Every field is a plain string, boolean, or number; never arrays, JSON
-strings, or XML tags."""
+Judge each probability on its own; the four need not sum to one.
+Use exactly one submit_plans call and fill all sixteen fields. For each plan i = 1, 2, 3,
+4, give plan_i_title, then plan_i_show_current_solution (true or false), then
+plan_i_success_probability (a number between 0 and 1), then plan_i_brief. Each field
+holds only its own value: never write the flag or the probability inside a brief. Every
+field is a plain string, boolean, or number; never arrays, JSON strings, or XML tags."""
 
-INDEPENDENT_PLANNER_SUFFIX = """Propose one plan. Use exactly one submit_plans call. Every field
-is a plain string, boolean, or number; never arrays, JSON strings, or XML tags."""
+INDEPENDENT_PLANNER_SUFFIX = """Propose one plan. Use exactly one submit_plans call and fill all
+four fields: plan_1_title, then plan_1_show_current_solution (true or false), then
+plan_1_success_probability (a number between 0 and 1), then plan_1_brief. Each field
+holds only its own value: never write the flag or the probability inside the brief. Every
+field is a plain string, boolean, or number; never arrays, JSON strings, or XML tags."""
 
-PLANNER_RECOVERY_SUFFIX = """Your response must be a native submit_plans call with every
-required field. show_current_solution fields are true or false; success_probability
-fields are numbers between 0 and 1. Keep each brief concise and do not solve the task
-here."""
+PLANNER_RECOVERY_SUFFIX = """Your response must be a native submit_plans call that fills
+every field: for each plan its title, show_current_solution (true or false),
+success_probability (a number between 0 and 1) and brief, in that order. Keep each brief
+concise and do not solve the task here."""
 
 EXECUTOR_SYSTEM_PROMPT = """You are solving a mathematical task by carrying out a brief written
 by a planner. Follow the brief. If it relies on a mathematical mistake, do not reproduce
@@ -99,7 +107,11 @@ class PlanParseError(HarnessAbort):
 
 @dataclass(frozen=True)
 class PlanSlot:
-    """One plan from a submit_plans call; ``error`` is set when it cannot be executed."""
+    """One plan from a submit_plans call.
+
+    ``error`` is set when the plan cannot be executed (no brief or no show flag);
+    ``success_probability`` is None when the planner gave no valid one.
+    """
 
     slot: int
     title: str | None
@@ -127,13 +139,13 @@ def plan_tool(slots: int) -> dict[str, Any]:
     properties: dict[str, Any] = {}
     for slot in range(1, slots + 1):
         properties[f"plan_{slot}_title"] = {"type": "string", "maxLength": TITLE_MAX_CHARS}
-        properties[f"plan_{slot}_brief"] = {"type": "string", "maxLength": BRIEF_MAX_CHARS}
         properties[f"plan_{slot}_show_current_solution"] = {"type": "boolean"}
         properties[f"plan_{slot}_success_probability"] = {
             "type": "number",
             "minimum": 0,
             "maximum": 1,
         }
+        properties[f"plan_{slot}_brief"] = {"type": "string", "maxLength": BRIEF_MAX_CHARS}
     return {
         "type": "function",
         "function": {
@@ -245,9 +257,8 @@ def parse_plan_arguments(arguments: Mapping[str, Any], slots: int) -> tuple[Plan
         show = _boolean(arguments.get(prefix + "show_current_solution"))
         if show is None:
             errors.append("show_current_solution must be true or false")
+        # The probability is recorded, not acted on, so a plan without a valid one still runs.
         probability = _probability(arguments.get(prefix + "success_probability"))
-        if probability is None:
-            errors.append("success_probability must be a number between 0 and 1")
         plans.append(
             PlanSlot(
                 slot=slot,
@@ -724,14 +735,13 @@ class _ReplanHarness:
         plan: PlanSlot,
         recovered: bool,
     ) -> _Outcome:
-        assert plan.success_probability is not None
         await runtime.transition(
             point,
             "planner",
             "plan",
             f"branch_{branch}",
             detail=_detail(
-                p=round(plan.success_probability, 6),
+                p=None if plan.success_probability is None else round(plan.success_probability, 6),
                 recovered=recovered,
                 show=plan.show_current_solution,
                 slot=plan.slot,

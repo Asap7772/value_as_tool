@@ -9,7 +9,7 @@ schema_version: 1
 # config fingerprint.
 
 paths:
-  artifact_root: artifacts/qwen35_9b_gvr_replan_joint_arxivmath_v1
+  artifact_root: artifacts/qwen35_9b_gvr_replan_joint_arxivmath_v2
   asset_root: artifacts/assets
 
 models:
