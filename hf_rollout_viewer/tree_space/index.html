@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Branched Generator-Verifier-Reviser trees from Qwen3.5-9B on ArXivMath: every candidate and verdict at 10 verification points with 4 branches each, graded by an external answer judge.">
+  <title>Value-as-Tool · GVR Tree Explorer</title>
+  <link rel="stylesheet" href="vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="styles.css">
+  <script src="config.js"></script>
+  <script src="vendor/katex/katex.min.js" defer></script>
+  <script src="vendor/katex/auto-render.min.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="brand"><span class="brand-mark">v·t</span><span>VALUE-AS-TOOL<span class="brand-sub">GVR Tree Explorer · Qwen3.5-9B on ArXivMath</span></span></div>
+    <nav>
+      <div class="view-tabs" role="tablist" aria-label="Pages">
+        <button type="button" role="tab" class="view-tab active" data-view="trees" aria-selected="true">Trees</button>
+        <button type="button" role="tab" class="view-tab" data-view="overview" aria-selected="false">Overview</button>
+      </div>
+      <a id="dataset-link" target="_blank" rel="noopener noreferrer">Data ↗</a>
+      <button id="help-toggle" class="text-button" type="button" aria-expanded="false" aria-controls="help">How to read this</button>
+    </nav>
+  </header>
+  <section id="help" class="help" hidden>
+    <p><strong>One tree per problem.</strong> The model writes a first solution <em>c1</em>. At each of 10 verification points, 4 independent verifier calls judge the current solution, and each verdict routes one revision. <em>Says correct</em> asks the reviser to re-check anyway; <em>minor fix</em> asks for a repair; <em>critical flaw</em> asks for a fresh attempt. The first successful revision (branch 0 unless it failed) becomes the next spine solution, so the spine runs c1 → c10, and c10 is the final output. The other three revisions at each point are one-step leaves.</p>
+    <p><strong>Nodes</strong> are candidate solutions, coloured by the external judge (gpt-oss-20b comparing the final <code>\boxed{}</code> answer with the gold answer): ✓ correct, ✗ incorrect. The letter names the candidate's final answer; the table under the tree lists them. <strong>Edges</strong> show what the verifier said about the parent and how the revision was asked for: solid for <em>says correct → re-check</em>, dashed for <em>minor fix → revise</em>, dotted for <em>critical flaw → regenerate</em>. Hover or focus a node or edge for details, and click a node to read the candidate, the critique that produced it, and the reasoning traces. Arrow keys move between nodes; <kbd>j</kbd>/<kbd>k</kbd> step through problems.</p>
+    <p><strong>Overview</strong> summarises all 1,649 trees: how often each revision mode changes the judge's label, how well verdicts track the judge, and how trees differ by difficulty (how often Qwen3.6-35B solved the problem in MathArena's 12 attempts).</p>
+  </section>
+  <main class="workspace" id="trees-view">
+    <aside class="sidebar" aria-label="Problems">
+      <div class="split-tabs" id="split-tabs" role="tablist" aria-label="Split"></div>
+      <input id="search" type="search" placeholder="Search id, arXiv id or statement…" autocomplete="off" aria-label="Search problems">
+      <div class="filters">
+        <label>Qwen3.6 difficulty
+          <select id="bucket-filter">
+            <option value="">All problems</option>
+            <option value="zero">Never solved (0/12)</option>
+            <option value="low">Solved &lt; half</option>
+            <option value="high">Solved ≥ half</option>
+            <option value="one">Always solved</option>
+          </select>
+        </label>
+        <label>Tree labels
+          <select id="kind-filter">
+            <option value="">All trees</option>
+            <option value="mixed">Mixed ✓ and ✗</option>
+            <option value="all_correct">All ✓</option>
+            <option value="all_incorrect">All ✗</option>
+            <option value="fixed">c1 ✗ → c10 ✓</option>
+            <option value="broken">c1 ✓ → c10 ✗</option>
+          </select>
+        </label>
+        <label class="wide">Sort
+          <select id="sort">
+            <option value="id">Problem id</option>
+            <option value="mixed">Most mixed first</option>
+            <option value="hard">Hardest for Qwen3.6 first</option>
+            <option value="easy">Easiest for Qwen3.6 first</option>
+            <option value="answers">Most distinct answers first</option>
+          </select>
+        </label>
+      </div>
+      <p id="list-count" class="hint"></p>
+      <ol id="problem-list" class="problem-list"></ol>
+    </aside>
+    <section id="detail" class="detail" aria-live="polite">
+      <div class="empty-state"><h2>Loading…</h2><p>Fetching the tree index.</p></div>
+    </section>
+  </main>
+  <main id="overview-view" class="overview" hidden></main>
+  <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+</body>
+</html>

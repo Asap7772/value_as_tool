@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Problem-by-problem viewer and summary statistics for Value-as-Tool proof rollouts: direct, GVR, reference-assisted and attempt-conditioned verifiers, value tools and plan-work-review harnesses.">
+  <title>Value-as-Tool · Rollout Explorer</title>
+  <link rel="stylesheet" href="vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="styles.css">
+  <script src="config.js"></script>
+  <script src="vendor/katex/katex.min.js" defer></script>
+  <script src="vendor/katex/auto-render.min.js" defer></script>
+  <script src="summary.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="brand"><span class="brand-mark">v·t</span><span>VALUE-AS-TOOL<span class="brand-sub">Rollout Explorer</span></span></div>
+    <nav>
+      <div class="view-tabs" role="tablist" aria-label="Pages">
+        <button type="button" role="tab" class="view-tab active" data-view="rollouts" aria-selected="true">Rollouts</button>
+        <button type="button" role="tab" class="view-tab" data-view="summary" aria-selected="false">Summary</button>
+        <button type="button" role="tab" class="view-tab" data-view="analysis" aria-selected="false">Analysis</button>
+      </div>
+      <a id="dataset-link" target="_blank" rel="noopener noreferrer">Data ↗</a>
+      <button id="help-toggle" class="text-button" type="button">How to read this</button>
+    </nav>
+  </header>
+  <section id="help" class="help" hidden>
+    <p><strong>Pick a benchmark and a problem</strong> on the left. The problem page shows the statement, the reference proof, the judge's grading rubric and the prior-attempt evidence packs. The grids below show every rollout of every method: rows are methods, columns are seeds, and each cell is the external judge's score (0–7, strict success = 7). ✓ means the trajectory's own verifier accepted the final candidate, ↻ means it hit the 3-candidate limit, and ⚠ marks protocol or budget errors.</p>
+    <p><strong>Click a cell</strong> to open that rollout. Each model call is shown in order, with its prompt (collapsed), private reasoning (collapsed) and response or tool call. Verifier calls show their verdict. <span class="marker-demo">⟦…⟧</span> chips inside prompts stand for text shown elsewhere (the problem, a candidate, an evidence pack, an earlier turn); click one to expand it. Continuation turns show only their new messages. <strong>Pin</strong> a rollout to compare it with another side by side. Use <kbd>j</kbd>/<kbd>k</kbd> to step through problems.</p>
+    <p><strong>Summary</strong> aggregates every rollout per method: 7/7 rate with 95% intervals, tokens, how runs end, GVR verifier calls and value-tool queries. <strong>Analysis</strong> asks what each method does on problems Direct gets wrong: fix and break rates against Direct, and what GVR's verifier does with its first candidate. Hover or focus any mark for its numbers; every chart has a table view.</p>
+  </section>
+  <main class="workspace" id="rollouts-view">
+    <aside class="sidebar" aria-label="Problems">
+      <div class="bench-tabs" id="bench-tabs" role="tablist"></div>
+      <input id="search" type="search" placeholder="Search id or statement…" autocomplete="off">
+      <div class="filters">
+        <label>Prior Direct attempts
+          <select id="bank-filter">
+            <option value="">All problems</option>
+            <option value="negative">0/8 correct</option>
+            <option value="mixed">Mixed</option>
+            <option value="positive">8/8 correct</option>
+          </select>
+        </label>
+        <label>Sort
+          <select id="sort">
+            <option value="id">Problem id</option>
+            <option value="hard">Hardest first</option>
+            <option value="easy">Easiest first</option>
+          </select>
+        </label>
+      </div>
+      <p id="list-count" class="hint"></p>
+      <ol id="problem-list" class="problem-list"></ol>
+    </aside>
+    <section id="detail" class="detail" aria-live="polite">
+      <div class="empty-state"><h2>Loading…</h2><p>Fetching the problem index.</p></div>
+    </section>
+  </main>
+  <main id="stats-view" class="stats" hidden></main>
+</body>
+</html>
