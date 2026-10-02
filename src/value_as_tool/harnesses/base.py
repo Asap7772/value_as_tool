@@ -77,6 +77,20 @@ class HarnessAbort(RuntimeError):
         self.status = status
 
 
+class HarnessReplayError(HarnessAbort):
+    """A checkpoint or label conflict: never contained by a harness."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(TrajectoryStatus.PROTOCOL_ERROR, message)
+
+
+class VerdictParseError(HarnessAbort):
+    """No usable verdict after the in-budget recovery attempt; usage is known."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(TrajectoryStatus.PROTOCOL_ERROR, message)
+
+
 @runtime_checkable
 class ProofHarness(Protocol):
     """A proof-solving policy evaluated by the trusted runtime."""
@@ -125,6 +139,9 @@ class HarnessRuntime:
         # a general-purpose prompt ingredient exposed to harness generators.
         request = replace(request, verifier_evidence=None)
         self.__request = request
+        # Labels of calls currently dispatched; concurrent harness tasks must
+        # never issue the same label twice.
+        self.__inflight_labels: set[str] = set()
 
     @property
     def request(self) -> TrajectoryRequest:
@@ -133,6 +150,12 @@ class HarnessRuntime:
     @property
     def minimum_call_tokens(self) -> int:
         return int(self.__orchestrator.config.minimum_call_tokens)
+
+    @property
+    def total_generated_tokens(self) -> int:
+        """The trajectory's whole generated-token budget."""
+
+        return int(self.__orchestrator.config.total_generated_tokens)
 
     @property
     def cch_stage_tokens(self) -> int | None:
@@ -187,12 +210,11 @@ class HarnessRuntime:
     ) -> tuple[ChatCompletion, int]:
         """Make or replay one uniquely labelled, budgeted model call."""
 
+        if label in self.__inflight_labels:
+            raise HarnessReplayError(f"harness call label {label!r} is already in flight")
         matches = [call for call in self.__state.result.calls if call.label == label]
         if len(matches) > 1:
-            raise HarnessAbort(
-                TrajectoryStatus.PROTOCOL_ERROR,
-                f"checkpoint contains duplicate harness call label {label!r}",
-            )
+            raise HarnessReplayError(f"checkpoint contains duplicate harness call label {label!r}")
         if matches:
             existing = matches[0]
             expected_messages = tuple(copy.deepcopy(dict(item)) for item in messages)
@@ -206,11 +228,11 @@ class HarnessRuntime:
                 or existing.response is None
                 or existing.error is not None
             ):
-                raise HarnessAbort(
-                    TrajectoryStatus.PROTOCOL_ERROR,
-                    f"checkpoint call {label!r} does not match the harness request",
+                raise HarnessReplayError(
+                    f"checkpoint call {label!r} does not match the harness request"
                 )
             return existing.response, existing.index
+        self.__inflight_labels.add(label)
         try:
             return await self.__orchestrator._call(
                 self.__state,
@@ -234,6 +256,93 @@ class HarnessRuntime:
             if isinstance(status, TrajectoryStatus):
                 raise HarnessAbort(status, str(exc)) from exc
             raise
+        finally:
+            self.__inflight_labels.discard(label)
+
+    def feedback_for(self, verdict: VerdictRecord) -> str:
+        """The bounded feedback text the built-in protocol shows a solver."""
+
+        return self.__orchestrator._feedback_for_solver(verdict)
+
+    async def verify(
+        self,
+        *,
+        cycle: int,
+        label: str,
+        candidate: str,
+        cap: int,
+        recovery_reserve: int = 0,
+        keep: int = 0,
+        rationale_score: bool = False,
+        branch: int | None = None,
+        parent_call_index: int | None = None,
+    ) -> VerdictRecord:
+        """A trusted verdict on ``candidate`` from at most two labelled calls.
+
+        The first call samples with ``cap - recovery_reserve`` tokens. If its
+        verdict cannot be parsed, one greedy call with thinking disabled,
+        labelled ``label + ".recovery"``, may use whatever the first left of
+        ``cap``. The orchestrator builds the prompt and parses and scrubs the
+        verdict, so a harness never handles privileged verifier evidence.
+        """
+
+        orchestrator, state = self.__orchestrator, self.__state
+        system, user, tools, tool_choice, recovery_suffix = orchestrator._verifier_request(
+            state, candidate, rationale_score=rationale_score
+        )
+        privileged = orchestrator._privileged_sources(state)
+        first_cap = cap - recovery_reserve
+        if first_cap < self.minimum_call_tokens:
+            raise ValueError("verifier cap leaves less than one minimum call before recovery")
+        errors: list[str] = []
+        spent = 0
+        for recovery in (False, True):
+            attempt_cap = cap - spent if recovery else first_cap
+            if attempt_cap < self.minimum_call_tokens:
+                break
+            attempt_label = f"{label}.recovery" if recovery else label
+            completion, call_index = await self.call(
+                role=Role.VERIFIER,
+                cycle=cycle,
+                label=attempt_label,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": f"{system}\n\n{recovery_suffix}" if recovery else system,
+                    },
+                    {"role": "user", "content": user},
+                ],
+                cap=attempt_cap,
+                keep=keep,
+                seed=self.stable_seed(attempt_label),
+                tools=tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=False,
+                force_no_thinking=recovery,
+                use_sampling=not recovery,
+            )
+            try:
+                verdict = orchestrator._parse_verdict_completion(
+                    state.result.request,
+                    cycle=cycle,
+                    candidate=candidate,
+                    completion=completion,
+                    call_index=call_index,
+                    privileged_sources=privileged,
+                    rationale_score=rationale_score,
+                )
+            except Exception as exc:
+                if not isinstance(getattr(exc, "status", None), TrajectoryStatus):
+                    raise
+                errors.append(
+                    "verifier response reached its generation limit"
+                    if completion.finish_reason == "length"
+                    else str(exc)
+                )
+                spent += completion.usage.completion_tokens
+                continue
+            return replace(verdict, branch=branch, parent_call_index=parent_call_index)
+        raise VerdictParseError(f"{label}: " + ("; ".join(errors) or "no verdict"))
 
     async def add_candidate(
         self,
@@ -243,52 +352,54 @@ class HarnessRuntime:
         content: str,
         reasoning: str | None,
         call_index: int,
+        branch: int | None = None,
+        parent_call_index: int | None = None,
     ) -> CandidateRecord:
-        existing = next(
-            (
-                candidate
-                for candidate in self.__state.result.candidates
-                if candidate.cycle == cycle
-            ),
-            None,
-        )
-        if existing is not None:
-            if (
-                existing.role is not role
-                or existing.content != content
-                or existing.reasoning != reasoning
-                or existing.call_index != call_index
-            ):
-                raise HarnessAbort(
-                    TrajectoryStatus.PROTOCOL_ERROR,
-                    f"checkpoint candidate {cycle} does not match the harness output",
-                )
-            return existing
+        """Record one candidate per ``(cycle, branch)``; replays must match."""
+
         record = CandidateRecord(
             cycle=cycle,
             role=role,
             content=content,
             reasoning=reasoning,
             call_index=call_index,
+            branch=branch,
+            parent_call_index=parent_call_index,
         )
-        self.__state.result.candidates.append(record)
-        await self.__state.sync()
-        return record
-
-    async def add_verdict(self, record: VerdictRecord) -> VerdictRecord:
         existing = next(
             (
-                verdict
-                for verdict in self.__state.result.verdicts
-                if verdict.cycle == record.cycle
+                candidate
+                for candidate in self.__state.result.candidates
+                if candidate.cycle == cycle and candidate.branch == branch
             ),
             None,
         )
         if existing is not None:
             if existing != record:
-                raise HarnessAbort(
-                    TrajectoryStatus.PROTOCOL_ERROR,
-                    f"checkpoint verdict {record.cycle} does not match the harness output",
+                raise HarnessReplayError(
+                    f"checkpoint candidate {cycle}/{branch} does not match the harness output"
+                )
+            return existing
+        self.__state.result.candidates.append(record)
+        await self.__state.sync()
+        return record
+
+    async def add_verdict(self, record: VerdictRecord) -> VerdictRecord:
+        """Record one verdict per ``(cycle, branch)``; replays must match."""
+
+        existing = next(
+            (
+                verdict
+                for verdict in self.__state.result.verdicts
+                if verdict.cycle == record.cycle and verdict.branch == record.branch
+            ),
+            None,
+        )
+        if existing is not None:
+            if existing != record:
+                raise HarnessReplayError(
+                    f"checkpoint verdict {record.cycle}/{record.branch} does not match "
+                    "the harness output"
                 )
             return existing
         self.__state.result.verdicts.append(record)
@@ -346,8 +457,10 @@ __all__ = [
     "ATTEMPT_CONDITIONING_MODES",
     "HarnessAbort",
     "HarnessAccess",
+    "HarnessReplayError",
     "HarnessRuntime",
     "HarnessSpec",
     "ProofHarness",
+    "VerdictParseError",
     "module_source_path",
 ]

@@ -361,6 +361,10 @@ class AttemptHandle:
                 "request_id": request_id,
                 "role": active.get("role"),
                 "usage": dict(usage),
+                # Per-request latency and caps for throughput analysis.
+                "started_at": active.get("started_at"),
+                "max_tokens": active.get("max_tokens"),
+                "metadata": active.get("metadata") or {},
                 "at": utc_now(),
             }
             append_jsonl(self.path / "events.jsonl", event)

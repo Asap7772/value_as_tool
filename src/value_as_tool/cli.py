@@ -20,6 +20,7 @@ from .harnesses import (
 )
 from .pipeline import (
     judge,
+    judge_nodes,
     load_context,
     preflight,
     prepare,
@@ -75,11 +76,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="for remote endpoints, download tokenizer/config files but not model weights",
     )
-    for name in ("solve", "judge"):
+    for name in ("solve", "judge", "judge-nodes"):
         stage = commands.add_parser(name, help=f"run a resumable {name} shard")
         stage.add_argument("--shard-index", type=int, default=0)
         stage.add_argument("--shard-count", type=int, default=1)
         stage.add_argument("--run-id", dest="run_ids", action="append")
+        if name == "judge-nodes":
+            stage.add_argument(
+                "--node-concurrency",
+                type=int,
+                default=8,
+                help="judge requests in flight per trajectory",
+            )
     conditioning = commands.add_parser(
         "conditioning", help="build, summarize, and freeze prior-attempt evidence"
     )
@@ -273,6 +281,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                     shard_index=args.shard_index,
                     shard_count=args.shard_count,
                     run_ids=args.run_ids,
+                )
+            )
+        )
+        return 0
+    if args.command == "judge-nodes":
+        _print(
+            asyncio.run(
+                judge_nodes(
+                    context,
+                    shard_index=args.shard_index,
+                    shard_count=args.shard_count,
+                    run_ids=args.run_ids,
+                    node_concurrency=args.node_concurrency,
                 )
             )
         )

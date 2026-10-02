@@ -22,14 +22,14 @@ cleanup_server() {
 }
 trap cleanup_server EXIT
 
-[[ $EXPERIMENT_STAGE == solve || $EXPERIMENT_STAGE == judge ]] || {
-  echo "GPU runner supports only solve or judge" >&2
+[[ $EXPERIMENT_STAGE == solve || $EXPERIMENT_STAGE == judge || $EXPERIMENT_STAGE == judge-nodes ]] || {
+  echo "GPU runner supports only solve, judge, or judge-nodes" >&2
   exit 2
 }
 server_role=qwen
 model_role=solver
 server_tensor_parallel_size=$SOLVER_TENSOR_PARALLEL_SIZE
-if [[ $EXPERIMENT_STAGE == judge ]]; then
+if [[ $EXPERIMENT_STAGE == judge || $EXPERIMENT_STAGE == judge-nodes ]]; then
   server_role=judge
   model_role=judge
   server_tensor_parallel_size=1
@@ -193,7 +193,10 @@ PY
 done
 [[ $server_ready == 1 ]] || { echo "model server startup timed out: $SERVER_LOG" >&2; exit 1; }
 
-if [[ -n ${VALUE_AS_TOOL_ATTEMPT_MANIFEST:-} ]]; then
+if [[ -n ${VALUE_AS_TOOL_GPU_COMMAND:-} ]]; then
+  # A one-off job against the started server, e.g. a judge-agreement study.
+  bash -c "$VALUE_AS_TOOL_GPU_COMMAND" &
+elif [[ -n ${VALUE_AS_TOOL_ATTEMPT_MANIFEST:-} ]]; then
   "$PYTHON_BIN" "${REPO_ROOT}/scripts/attempt_conditioning_worker.py" \
     --config "$EXPERIMENT_CONFIG" --manifest "$VALUE_AS_TOOL_ATTEMPT_MANIFEST" \
     --stage "${VALUE_AS_TOOL_ATTEMPT_STAGE:?}" --queue "${VALUE_AS_TOOL_ATTEMPT_QUEUE:?}" &

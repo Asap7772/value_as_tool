@@ -312,7 +312,7 @@ def _resolve_harnesses(entrypoints: Iterable[str]) -> tuple[HarnessSpec, ...]:
 
 
 def _benchmark_order(keys: Iterable[str]) -> list[str]:
-    preferred = ("imo_proof", "proofbench", "imo_answer")
+    preferred = ("imo_proof", "proofbench", "imo_answer", "arxivmath_train", "arxivmath_eval")
     key_set = set(keys)
     return [key for key in preferred if key in key_set] + sorted(key_set - set(preferred))
 

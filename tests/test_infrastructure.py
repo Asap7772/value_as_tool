@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tomllib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import Any
 
@@ -13,13 +14,14 @@ from pydantic import ValidationError
 
 from value_as_tool import assets
 from value_as_tool.assets import (
+    load_prepared_benchmarks,
     model_snapshot_path,
     prepare_benchmark_assets,
     prepare_model_assets,
     prepared_benchmark_path,
 )
-from value_as_tool.benchmarks import BenchmarkItem
-from value_as_tool.config import ExperimentConfig, PathsConfig, load_config
+from value_as_tool.benchmarks import BENCHMARKS, BenchmarkItem
+from value_as_tool.config import ExperimentConfig, PathsConfig, PreparedDatasetConfig, load_config
 from value_as_tool.identity import package_source_sha256
 from value_as_tool.schedule import (
     build_schedule,
@@ -264,6 +266,73 @@ def test_benchmark_preparation_uses_configured_dataset_pins(
     assert seen["imo_proof"] == ("custom/imo-proof", revision, "validation")
     assert manifest["benchmarks"]["imo_proof"]["dataset"] == "custom/imo-proof"
     assert manifest["benchmarks"]["imo_proof"]["revision"] == revision
+
+
+def _prepared_arxivmath_config(tmp_path: Path) -> ExperimentConfig:
+    rows = [
+        {"item_id": f"arxivmath-{index}", "problem": f"Compute {index}.", "gold_answer": str(index)}
+        for index in (1, 2)
+    ]
+    path = tmp_path / "assets" / "benchmarks" / "arxivmath" / "train.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return load_config(
+        None,
+        overrides={
+            "paths": {
+                "artifact_root": str(tmp_path / "artifacts"),
+                "asset_root": str(tmp_path / "assets"),
+            },
+            "datasets": {
+                "arxivmath_train": {
+                    "name": "MathArena/arxivmath-training_outputs",
+                    "revision": "b" * 40,
+                    "split": "train",
+                    "path": "benchmarks/arxivmath/train.jsonl",
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+            },
+            "evaluation": {"benchmarks": ["arxivmath_train"]},
+        },
+    )
+
+
+def test_prepared_datasets_are_hash_pinned_and_prepared_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _prepared_arxivmath_config(tmp_path)
+    monkeypatch.setitem(
+        BENCHMARKS, "arxivmath_train", replace(BENCHMARKS["arxivmath_train"], expected_rows=2)
+    )
+
+    def no_hub(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("prepared datasets and unselected benchmarks never touch the Hub")
+
+    monkeypatch.setattr(assets, "load_benchmark", no_hub)
+    manifest = prepare_benchmark_assets(config)
+    items = load_prepared_benchmarks(config)
+
+    assert list(manifest["benchmarks"]) == ["arxivmath_train"]
+    assert manifest["benchmarks"]["arxivmath_train"]["revision"] == "b" * 40
+    assert [item.item_id for item in items["arxivmath_train"]] == ["arxivmath-1", "arxivmath-2"]
+    assert [item.answer for item in items["arxivmath_train"]] == ["1", "2"]
+    assert not items["arxivmath_train"][0].is_proof
+
+    (tmp_path / "assets" / "benchmarks" / "arxivmath" / "train.jsonl").write_text("{}\n")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        prepare_benchmark_assets(config)
+
+
+def test_prepared_dataset_entries_are_validated_and_optional() -> None:
+    base = {"name": "x/y", "revision": "c" * 40, "split": "train", "sha256": "d" * 64}
+    for path in ("/abs/train.jsonl", "../train.jsonl", ""):
+        with pytest.raises(ValidationError):
+            PreparedDatasetConfig(**base, path=path)
+    with pytest.raises(ValidationError):
+        PreparedDatasetConfig(**{**base, "sha256": "abc"}, path="train.jsonl")
+    with pytest.raises(ValidationError, match="no dataset entry"):
+        load_config(None, overrides={"evaluation": {"benchmarks": ["arxivmath_eval"]}})
+    assert "arxivmath_train" not in ExperimentConfig().to_dict()["datasets"]
 
 
 def test_tokenizer_only_preparation_avoids_model_weight_patterns(

@@ -66,6 +66,9 @@ class BenchmarkSpec:
     rubric_columns: tuple[str, ...] = ()
     judge_prompt: str = "imo_proof_judge"
     reference_verifier: bool = True
+    # "huggingface" loads the pinned Hub split; "prepared_jsonl" reads a
+    # hash-pinned file built offline (see scripts/prepare_arxivmath_dataset.py).
+    source: str = "huggingface"
 
 
 BENCHMARKS: dict[str, BenchmarkSpec] = {
@@ -100,6 +103,36 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         judge_prompt="answer_judge",
         reference_verifier=False,
     ),
+    # Distinct problems of MathArena/arxivmath-training_outputs, split with
+    # meta-rubrics-midtraining's hold-out rule.
+    "arxivmath_train": BenchmarkSpec(
+        name="arxivmath_train",
+        display_name="ArXivMath (train)",
+        dataset="MathArena/arxivmath-training_outputs",
+        revision="02002a6d4e39033de27adeb4e4683deeb6f22850",
+        expected_rows=1_502,
+        split="train",
+        kind="answer",
+        answer_columns=("gold_answer",),
+        solution_columns=(),
+        judge_prompt="answer_judge",
+        reference_verifier=False,
+        source="prepared_jsonl",
+    ),
+    "arxivmath_eval": BenchmarkSpec(
+        name="arxivmath_eval",
+        display_name="ArXivMath (eval)",
+        dataset="MathArena/arxivmath-training_outputs",
+        revision="02002a6d4e39033de27adeb4e4683deeb6f22850",
+        expected_rows=147,
+        split="eval",
+        kind="answer",
+        answer_columns=("gold_answer",),
+        solution_columns=(),
+        judge_prompt="answer_judge",
+        reference_verifier=False,
+        source="prepared_jsonl",
+    ),
 }
 DEFAULT_BENCHMARKS = BENCHMARKS
 
@@ -115,6 +148,10 @@ BENCHMARK_ALIASES = {
     "imoanswerbench": "imo_answer",
     "imobench-finalanswer": "imo_answer",
     "hwilner/imo-answerbench": "imo_answer",
+    "arxivmath_train": "arxivmath_train",
+    "arxivmath-train": "arxivmath_train",
+    "arxivmath_eval": "arxivmath_eval",
+    "arxivmath-eval": "arxivmath_eval",
 }
 
 
@@ -269,11 +306,12 @@ def load_all_benchmarks(
     cache_dir: str | Path | None = None,
     check_size: bool = True,
 ) -> dict[str, list[BenchmarkItem]]:
-    """Load all three pinned datasets. This is the only network-capable helper."""
+    """Load every pinned Hub dataset. This is the only network-capable helper."""
 
     return {
         name: load_benchmark(spec, cache_dir=cache_dir, check_size=check_size)
         for name, spec in BENCHMARKS.items()
+        if spec.source == "huggingface"
     }
 
 

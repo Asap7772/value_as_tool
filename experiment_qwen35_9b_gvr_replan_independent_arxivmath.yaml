@@ -1,0 +1,96 @@
+schema_version: 1
+
+# Replanning GVR trees on ArXivMath (harnesses/gvr_replan.py,
+# IndependentPlanHarness): one tree per problem with 10 verification points x 4
+# branches. At every point four planner calls, given the same input, each write
+# one executor brief; an executor sees only the task, its brief and, if the plan
+# shows it, the current candidate. `judge-nodes` grades every candidate.
+# Launches place artifacts on /checkpoint through VALUE_AS_TOOL_ARTIFACT_ROOT,
+# which does not change the config fingerprint.
+
+paths:
+  artifact_root: artifacts/qwen35_9b_gvr_replan_independent_arxivmath_v1
+  asset_root: artifacts/assets
+
+models:
+  solver:
+    name: Qwen/Qwen3.5-9B
+    revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+    base_url: http://127.0.0.1:8000/v1
+    api_key_env: MODEL_API_KEY
+  judge:
+    name: openai/gpt-oss-20b
+    revision: 6cee5e81ee83917806bbde320786a8fb61efebee
+    base_url: http://127.0.0.1:8001/v1
+    api_key_env: LLAMA_API_KEY
+
+# Built by scripts/prepare_arxivmath_dataset.py (paths are under asset_root).
+datasets:
+  arxivmath_train:
+    name: MathArena/arxivmath-training_outputs
+    revision: 02002a6d4e39033de27adeb4e4683deeb6f22850
+    split: train
+    path: benchmarks/arxivmath/02002a6d4e39033de27adeb4e4683deeb6f22850/train.jsonl
+    sha256: c262fb0d831b408e3717dff83564c6e6efc3ee68be6ac77e5b6c80ddc2eb8c8b
+  arxivmath_eval:
+    name: MathArena/arxivmath-training_outputs
+    revision: 02002a6d4e39033de27adeb4e4683deeb6f22850
+    split: eval
+    path: benchmarks/arxivmath/02002a6d4e39033de27adeb4e4683deeb6f22850/eval.jsonl
+    sha256: bf1a08c18739f07a80a457702dd09b3571618b3f04f0fc99129cf99b43de48e1
+
+sampling:
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  min_p: 0.0
+  presence_penalty: 1.5
+  repetition_penalty: 1.0
+  enable_thinking: true
+  thinking_content_reserve_tokens: 0
+
+# The harness sets its own per-call caps (98,304 candidate / 49,152 verifier /
+# 49,152 planner); its worst case (6,488,064 joint, 7,962,624 independent
+# generated tokens) fits this trajectory budget.
+budget:
+  generated_tokens: 8388608
+  context_tokens: 262144
+  context_headroom_tokens: 1024
+  initial_generator_tokens: 2621440
+  verifier_tokens: 524288
+  correction_pool_tokens: 5242880
+  max_candidate_versions: 3
+  minimum_call_tokens: 1024
+
+subagents:
+  max_children: 3
+  max_depth: 1
+  child_tokens: 262144
+  final_candidate_reserve_tokens: 262144
+  max_context_chars: 4000
+
+value_tool:
+  max_queries: 3
+  verifier_tokens: 262144
+  final_response_reserve_tokens: 262144
+
+evaluation:
+  conditions: []
+  harnesses:
+    - value_as_tool.harnesses.gvr_replan:IndependentPlanHarness
+  benchmarks: [arxivmath_train, arxivmath_eval]
+  seeds: [0]
+  direct_answer_compatibility_seed: 0
+  bootstrap_samples: 10000
+  judge_reasoning_effort: medium
+  judge_output_tokens: 95000
+
+runtime:
+  solver_backend: sglang
+  solver_tensor_parallel_size: 1
+  request_timeout_seconds: 18000
+  max_retries: 3
+  max_concurrency: 2
+  solve_shards: 256
+  judge_shards: 16
+  resume: true

@@ -151,6 +151,10 @@ def judge_store_path(source: StageSource) -> Path:
     return _context(source).artifact_root / "judge"
 
 
+def node_judge_store_path(source: StageSource) -> Path:
+    return _context(source).artifact_root / "node_judge"
+
+
 def report_path(source: StageSource) -> Path:
     return _context(source).artifact_root / "report"
 
@@ -168,11 +172,15 @@ def _load_schedule(context: PipelineContext) -> Schedule:
 def _store(
     context: PipelineContext,
     schedule: Schedule,
-    stage: Literal["solve", "judge"],
+    stage: Literal["solve", "judge", "node_judge"],
     *,
     initialize: bool = True,
 ) -> ArtifactStore:
-    root = solve_store_path(context) if stage == "solve" else judge_store_path(context)
+    root = {
+        "solve": solve_store_path,
+        "judge": judge_store_path,
+        "node_judge": node_judge_store_path,
+    }[stage](context)
     store = ArtifactStore(
         root,
         config_fingerprint=context.config_fingerprint,
@@ -647,6 +655,21 @@ async def _solve_one(
     return "invalidated"
 
 
+def _operational_concurrency(context: PipelineContext, environ: Mapping[str, str]) -> int:
+    """Trajectories in flight per process.
+
+    ``VALUE_AS_TOOL_MAX_CONCURRENCY`` tunes a launch without changing the
+    config fingerprint, and therefore without changing any run ID.
+    """
+
+    value = environ.get("VALUE_AS_TOOL_MAX_CONCURRENCY")
+    if not value:
+        return context.config.runtime.max_concurrency
+    if not value.isdigit() or int(value) < 1:
+        raise ValueError("VALUE_AS_TOOL_MAX_CONCURRENCY must be a positive integer")
+    return int(value)
+
+
 async def _bounded_map(
     items: Sequence[ScheduleItem],
     concurrency: int,
@@ -712,7 +735,7 @@ async def solve(
     try:
         outcomes = await _bounded_map(
             selected,
-            context.config.runtime.max_concurrency,
+            _operational_concurrency(context, environ),
             lambda item: _solve_one(
                 item,
                 context=context,
@@ -958,7 +981,7 @@ async def judge(
     try:
         outcomes = await _bounded_map(
             selected,
-            context.config.runtime.max_concurrency,
+            _operational_concurrency(context, environ),
             lambda item: _judge_one(
                 item,
                 context=context,
@@ -973,6 +996,280 @@ async def judge(
             await client.aclose()  # type: ignore[attr-defined]
     return {
         "stage": "judge",
+        "schedule_fingerprint": schedule.fingerprint,
+        "shard_index": shard_index,
+        "shard_count": shard_count,
+        "selected": len(selected),
+        "outcomes": dict(sorted(outcomes.items())),
+    }
+
+
+def tree_nodes(solve_result: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Every recorded candidate of a trajectory, ordered by its producing call."""
+
+    nodes = []
+    for candidate in solve_result.get("candidates", []):
+        nodes.append(
+            {
+                "call_index": int(candidate["call_index"]),
+                "cycle": int(candidate["cycle"]),
+                "branch": candidate.get("branch"),
+                "parent_call_index": candidate.get("parent_call_index"),
+                "role": str(candidate["role"]),
+                "content_sha256": hashlib.sha256(
+                    str(candidate.get("content") or "").encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+    return sorted(nodes, key=lambda node: node["call_index"])
+
+
+async def judge_tree_nodes(
+    solve_result: Mapping[str, Any],
+    item: BenchmarkItem,
+    runner: JudgeRunner,
+    client: ChatClient,
+    *,
+    concurrency: int,
+    handle: Any | None = None,
+) -> dict[str, Any]:
+    """Judge every candidate of a trajectory, once per distinct judge prompt.
+
+    An answer judge sees only the extracted final answer, so candidates that
+    agree share one judgment. ``handle`` receives begin/complete markers for
+    each request; any judgment without exact usage raises so the caller can
+    invalidate the attempt.
+    """
+
+    texts = {
+        int(candidate["call_index"]): str(candidate.get("content") or "")
+        for candidate in solve_result.get("candidates", [])
+    }
+    node_prompt: dict[int, str | None] = {}
+    node_error: dict[int, tuple[str, str]] = {}
+    pending: dict[str, tuple[str, Any]] = {}
+    for call_index, text in texts.items():
+        if not text.strip():
+            node_prompt[call_index] = None
+            node_error[call_index] = ("empty_answer", "candidate has no content")
+            continue
+        try:
+            _, plan = build_judge_request(
+                item,
+                text,
+                prompts=runner.prompts,
+                max_tokens=runner.max_tokens,
+                token_counter=runner.token_counter,
+            )
+        except Exception as exc:
+            node_prompt[call_index] = None
+            node_error[call_index] = ("context_error", str(exc))
+            continue
+        key = hashlib.sha256(plan.prompt.encode("utf-8")).hexdigest()
+        node_prompt[call_index] = key
+        pending.setdefault(key, (text, plan))
+
+    judgments: dict[str, JudgeResult] = {}
+    limit = asyncio.Semaphore(max(1, concurrency))
+
+    async def judge_prompt(key: str, text: str, plan: Any) -> None:
+        async with limit:
+            request_id = f"node-judge-{key[:24]}"
+            if handle is not None:
+                handle.begin_request(
+                    request_id,
+                    role="judge",
+                    max_tokens=plan.max_tokens,
+                    metadata={"judge_prompt_sha256": key, "input_tokens": plan.input_tokens},
+                )
+            result = await runner.judge(item, text, client)
+            if not result.usage.get("usage_exact", False):
+                raise RuntimeError(
+                    result.error or f"judge request {request_id} returned without exact usage"
+                )
+            if handle is not None:
+                handle.complete_request(
+                    request_id,
+                    state="node_judge.running",
+                    payload={"judged_prompts": len(judgments) + 1},
+                    usage=result.usage,
+                )
+            judgments[key] = result
+
+    async with asyncio.TaskGroup() as group:
+        for key, (text, plan) in pending.items():
+            group.create_task(judge_prompt(key, text, plan))
+
+    nodes = []
+    for node in tree_nodes(solve_result):
+        key = node_prompt[node["call_index"]]
+        if key is None:
+            status, error = node_error[node["call_index"]]
+            nodes.append(
+                {
+                    **node,
+                    "judge_prompt_sha256": None,
+                    "judge_status": status,
+                    "score": None,
+                    "correct": False,
+                    "judge_error": error,
+                }
+            )
+            continue
+        result = judgments[key]
+        nodes.append(
+            {
+                **node,
+                "judge_prompt_sha256": key,
+                "judge_status": result.status,
+                "score": result.score,
+                "correct": result.correct,
+            }
+        )
+    usage = {
+        field: sum(int(result.usage.get(field) or 0) for result in judgments.values())
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens")
+    }
+    statuses = Counter(node["judge_status"] for node in nodes)
+    return {
+        "nodes": nodes,
+        "judgments": {key: result.to_dict() for key, result in sorted(judgments.items())},
+        "judge_usage": {**usage, "usage_exact": True},
+        "node_status_counts": dict(sorted(statuses.items())),
+        "judge_status": "completed" if set(statuses) <= {"completed"} else "partial",
+    }
+
+
+async def _judge_nodes_one(
+    item: ScheduleItem,
+    *,
+    context: PipelineContext,
+    solve_store: ArtifactStore,
+    node_store: ArtifactStore,
+    client: ChatClient,
+    runner: JudgeRunner,
+    concurrency: int,
+) -> str:
+    """Judge every candidate of one solved trajectory, whatever its status."""
+
+    solve_result = solve_store.load_result(item.run_id)
+    if solve_result is None:
+        return "solve_missing"
+    _result_matches_item(item, solve_result)
+    nodes_sha256 = hashlib.sha256(canonical_json(tree_nodes(solve_result)).encode()).hexdigest()
+    identity = {
+        **_schedule_identity(item, stage="node_judge"),
+        "nodes_sha256": nodes_sha256,
+        "solve_status": str(solve_result.get("status", "failed")),
+    }
+    retries = context.config.runtime.max_retries
+    for retry in range(retries + 1):
+        try:
+            claim = node_store.claim(
+                item.run_id,
+                identity=identity,
+                resume=context.config.runtime.resume,
+            )
+        except RunClaimedError:
+            return "claimed_elsewhere"
+        if claim.action is ClaimAction.COMPLETE:
+            assert claim.result is not None
+            if claim.result.get("nodes_sha256") != nodes_sha256:
+                raise ArtifactMismatchError(f"node judge candidates mismatch for {item.run_id}")
+            return "already_complete"
+        handle = claim.handle
+        assert handle is not None
+        base = {**_judge_base_record(item, solve_result), "nodes_sha256": nodes_sha256}
+        handle.save_checkpoint("node_judge.ready", base)
+        try:
+            judged = await judge_tree_nodes(
+                solve_result,
+                _benchmark_item(item),
+                runner,
+                client,
+                concurrency=concurrency,
+                handle=handle,
+            )
+        except asyncio.CancelledError:
+            handle.close()
+            raise
+        except Exception as exc:
+            handle.invalidate(
+                f"node_judge_error: {type(exc).__name__}: {exc}",
+                unknown_usage=True,
+            )
+            if retry < retries:
+                continue
+            return "invalidated"
+        record = {**base, **judged}
+        handle.finalize(record)
+        return str(record["judge_status"])
+    return "invalidated"
+
+
+async def judge_nodes(
+    source: StageSource,
+    *,
+    shard_index: int = 0,
+    shard_count: int = 1,
+    client: ChatClient | None = None,
+    token_counter: Any | None = None,
+    prompts: QEDPromptSet | None = None,
+    environment: Mapping[str, str] | None = None,
+    run_ids: Sequence[str] | None = None,
+    node_concurrency: int = 8,
+) -> dict[str, Any]:
+    """Condition-blind judging of every candidate, in a separate store.
+
+    ``runtime.max_concurrency`` trees are judged at once, each with up to
+    ``node_concurrency`` judge requests in flight.
+    """
+
+    context = _context(source)
+    schedule = _load_schedule(context)
+    selected = _select_items(schedule, shard_index, shard_count, run_ids)
+    solve_store = _store(context, schedule, "solve", initialize=False)
+    node_store = _store(context, schedule, "node_judge")
+    if token_counter is None:
+        token_counter = HuggingFaceTokenCounter(
+            _model_entry(context, "judge")["path"], enable_thinking=False
+        )
+    runner = JudgeRunner(
+        prompts or QEDPromptSet(),
+        max_tokens=context.config.evaluation.judge_output_tokens,
+        token_counter=token_counter,
+        reasoning_effort=context.config.evaluation.judge_reasoning_effort,
+        model=context.config.models.judge.name,
+    )
+    environ = os.environ if environment is None else environment
+    owns_client = client is None
+    if client is None:
+        model = context.config.models.judge
+        client = OpenAIChatClient(
+            context.config.models.operational_base_url("judge", environ),
+            api_key=environ.get(model.api_key_env),
+            timeout=context.config.runtime.request_timeout_seconds,
+        )
+    assert client is not None
+    try:
+        outcomes = await _bounded_map(
+            selected,
+            _operational_concurrency(context, environ),
+            lambda item: _judge_nodes_one(
+                item,
+                context=context,
+                solve_store=solve_store,
+                node_store=node_store,
+                client=client,
+                runner=runner,
+                concurrency=node_concurrency,
+            ),
+        )
+    finally:
+        if owns_client:
+            await client.aclose()  # type: ignore[attr-defined]
+    return {
+        "stage": "node_judge",
         "schedule_fingerprint": schedule.fingerprint,
         "shard_index": shard_index,
         "shard_count": shard_count,
@@ -1333,12 +1630,17 @@ def status(source: StageSource) -> dict[str, Any]:
     judge_store = _store(context, schedule, "judge", initialize=False)
     _ensure_expected_runs(solve_store, schedule)
     _ensure_expected_runs(judge_store, schedule)
-    return {
+    report = {
         "config_fingerprint": context.config_fingerprint,
         "schedule_fingerprint": schedule.fingerprint,
         "solve": _stage_status(solve_store, schedule),
         "judge": _stage_status(judge_store, schedule),
     }
+    node_store = _store(context, schedule, "node_judge", initialize=False)
+    if node_store.manifest_path.exists():
+        _ensure_expected_runs(node_store, schedule)
+        report["node_judge"] = _stage_status(node_store, schedule)
+    return report
 
 
 def serve(
@@ -1413,9 +1715,12 @@ __all__ = [
     "all_stages",
     "joined_rows",
     "judge",
+    "judge_nodes",
     "judge_stage",
     "judge_store_path",
+    "judge_tree_nodes",
     "load_context",
+    "node_judge_store_path",
     "preflight",
     "preflight_stage",
     "prepare",
@@ -1433,4 +1738,5 @@ __all__ = [
     "smoke",
     "status",
     "status_stage",
+    "tree_nodes",
 ]

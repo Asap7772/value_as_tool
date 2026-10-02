@@ -25,7 +25,7 @@ readonly ENV_FILE=${VALUE_AS_TOOL_ENV_FILE:-${REPO_ROOT}/.env}
 # Slurm starts batch scripts with a sanitized PATH. The model server entry
 # points are absolute, but both SGLang and vLLM invoke sibling build tools such
 # as ninja by name while compiling first-run kernels.
-if [[ $EXPERIMENT_STAGE == solve || $EXPERIMENT_STAGE == judge ]]; then
+if [[ $EXPERIMENT_STAGE == solve || $EXPERIMENT_STAGE == judge || $EXPERIMENT_STAGE == judge-nodes ]]; then
   for server_binary_variable in VALUE_AS_TOOL_SGLANG_BIN VALUE_AS_TOOL_VLLM_BIN; do
     server_binary=${!server_binary_variable:-}
     if [[ -n $server_binary ]]; then

@@ -13,7 +13,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .benchmarks import BENCHMARKS, BenchmarkItem, load_benchmark, row_to_item
+from .benchmarks import (
+    BENCHMARKS,
+    BenchmarkItem,
+    load_benchmark,
+    read_benchmark_jsonl,
+    row_to_item,
+)
 from .config import ExperimentConfig
 from .storage import atomic_write_json, atomic_write_text
 
@@ -56,21 +62,41 @@ def model_manifest_path(config: ExperimentConfig) -> Path:
     return config.paths.artifact_root / "prepared" / "models" / "manifest.json"
 
 
+def _load_prepared_source(config: ExperimentConfig, name: str) -> list[BenchmarkItem]:
+    """Read a hash-pinned, locally built split without network access."""
+
+    source = getattr(config.datasets, name)
+    path = config.paths.asset_root / source.path
+    if _sha256(path) != source.sha256:
+        raise ValueError(f"prepared dataset hash mismatch for {name}: {path}")
+    configured_spec = replace(
+        BENCHMARKS[name],
+        dataset=source.name,
+        revision=source.revision,
+        split=source.split,
+    )
+    return read_benchmark_jsonl(path, configured_spec, check_size=True)
+
+
 def prepare_benchmark_assets(config: ExperimentConfig) -> dict[str, Any]:
-    """Download and normalize the three pinned benchmark snapshots."""
+    """Download and normalize the experiment's selected benchmark snapshots."""
 
     root = config.paths.artifact_root
     cache = config.paths.asset_root / "huggingface"
     manifest: dict[str, Any] = {"schema_version": 1, "benchmarks": {}}
-    for name, schema in BENCHMARKS.items():
+    for name in config.evaluation.benchmarks:
+        schema = BENCHMARKS[name]
         source = getattr(config.datasets, name)
-        configured_spec = replace(
-            schema,
-            dataset=source.name,
-            revision=source.revision,
-            split=source.split,
-        )
-        items = load_benchmark(configured_spec, cache_dir=cache, check_size=True)
+        if schema.source == "prepared_jsonl":
+            items = _load_prepared_source(config, name)
+        else:
+            configured_spec = replace(
+                schema,
+                dataset=source.name,
+                revision=source.revision,
+                split=source.split,
+            )
+            items = load_benchmark(configured_spec, cache_dir=cache, check_size=True)
         destination = prepared_benchmark_path(root, name)
         payload = "".join(
             json.dumps(item.raw, ensure_ascii=False, sort_keys=True, default=str) + "\n"
@@ -98,7 +124,8 @@ def load_prepared_benchmarks(config: ExperimentConfig) -> dict[str, list[Benchma
     if not isinstance(manifest, dict) or not isinstance(manifest.get("benchmarks"), dict):
         raise ValueError(f"invalid benchmark manifest: {manifest_path}")
     result: dict[str, list[BenchmarkItem]] = {}
-    for name, spec in BENCHMARKS.items():
+    for name in config.evaluation.benchmarks:
+        spec = BENCHMARKS[name]
         path = prepared_benchmark_path(config.paths.artifact_root, name)
         entry = manifest["benchmarks"].get(name)
         source = getattr(config.datasets, name)

@@ -26,6 +26,8 @@ BENCHMARK_LABELS = {
     "imo_proof": "IMO-Proof",
     "proofbench": "ProofBench",
     "imo_answer": "IMO-Answer",
+    "arxivmath_train": "ArXivMath-Train",
+    "arxivmath_eval": "ArXivMath-Eval",
 }
 
 
@@ -152,7 +154,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
 
     benchmarks = _ordered(
         (str(row["benchmark"]) for row in compatibility),
-        ("imo_proof", "proofbench", "imo_answer"),
+        ("imo_proof", "proofbench", "imo_answer", "arxivmath_train", "arxivmath_eval"),
     )
     methods = sorted({_method_key(row) for row in compatibility}, key=_method_sort_key)
     compatibility_lookup = {

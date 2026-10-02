@@ -454,6 +454,11 @@ class CandidateRecord:
     content: str
     reasoning: str | None
     call_index: int
+    # Tree-structured harnesses record several candidates per cycle. ``branch``
+    # distinguishes siblings and ``parent_call_index`` names the call that
+    # produced the state they branch from; linear protocols leave both unset.
+    branch: int | None = None
+    parent_call_index: int | None = None
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> CandidateRecord:
@@ -466,10 +471,12 @@ class CandidateRecord:
             content=_required_string(value, "content", allow_empty=True),
             reasoning=reasoning,
             call_index=_required_int(value, "call_index"),
+            branch=_nullable_int(value, "branch"),
+            parent_call_index=_nullable_int(value, "parent_call_index"),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return _jsonable(asdict(self))
+        return _drop_unset_tree_fields(_jsonable(asdict(self)))
 
 
 @dataclass(frozen=True)
@@ -482,6 +489,10 @@ class VerdictRecord:
     call_index: int
     success_probability: float | None = None
     rationale: str = ""
+    # See CandidateRecord: set only by tree-structured harnesses, where
+    # ``parent_call_index`` is the call that produced the judged candidate.
+    branch: int | None = None
+    parent_call_index: int | None = None
 
     def __post_init__(self) -> None:
         probability = self.success_probability
@@ -527,10 +538,12 @@ class VerdictRecord:
             rationale=_required_string(value, "rationale", allow_empty=True)
             if "rationale" in value
             else "",
+            branch=_nullable_int(value, "branch"),
+            parent_call_index=_nullable_int(value, "parent_call_index"),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        value = _jsonable(asdict(self))
+        value = _drop_unset_tree_fields(_jsonable(asdict(self)))
         if self.success_probability is None:
             value.pop("success_probability", None)
             value.pop("rationale", None)
@@ -719,7 +732,12 @@ class TrajectoryResult:
         value = _jsonable(asdict(self))
         if self.request.verifier_evidence is None:
             value["request"].pop("verifier_evidence", None)
+        for candidate in value.get("candidates", []):
+            if isinstance(candidate, dict):
+                _drop_unset_tree_fields(candidate)
         for verdict in value.get("verdicts", []):
+            if isinstance(verdict, dict):
+                _drop_unset_tree_fields(verdict)
             if isinstance(verdict, dict) and verdict.get("success_probability") is None:
                 verdict.pop("success_probability", None)
                 verdict.pop("rationale", None)
@@ -789,6 +807,30 @@ def _optional_int(value: Any) -> int | None:
     # bool is an int subclass but never a meaningful token count.
     if isinstance(value, bool) or not isinstance(value, int):
         return None
+    return value
+
+
+def _nullable_int(value: Mapping[str, Any], key: str) -> int | None:
+    """An absent or null field is None; anything else must be an integer."""
+
+    item = value.get(key)
+    if item is None:
+        return None
+    parsed = _optional_int(item)
+    if parsed is None:
+        raise ValueError(f"{key} must be an integer or null")
+    return parsed
+
+
+_TREE_FIELDS = ("branch", "parent_call_index")
+
+
+def _drop_unset_tree_fields(value: dict[str, Any]) -> dict[str, Any]:
+    """Keep linear-protocol artifacts byte-identical to their legacy form."""
+
+    for key in _TREE_FIELDS:
+        if value.get(key) is None:
+            value.pop(key, None)
     return value
 
 

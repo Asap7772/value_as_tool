@@ -2377,23 +2377,27 @@ class AletheiaOrchestrator:
             )
         return tasks
 
-    async def _verify(
+    def _verifier_request(
         self,
         state: _RunState,
-        *,
-        cycle: int,
         candidate: str,
-        keep: int,
-    ) -> VerdictRecord:
-        """Obtain a verdict, with one in-budget formatting recovery attempt."""
+        *,
+        rationale_score: bool | None = None,
+    ) -> tuple[str, str, list[Mapping[str, Any]], Mapping[str, Any], str]:
+        """System prompt, user message, tools, tool choice and recovery suffix.
+
+        ``rationale_score`` defaults to the request's condition; harnesses,
+        which have no condition, choose the verdict protocol explicitly.
+        """
 
         request = state.result.request
         reference_mode = self._reference_enabled(state)
-        rationale_score_mode = request.condition in {
-            Condition.GVR_RATIONALE_SCORE,
-            Condition.GVR_REFERENCE_RATIONALE_SCORE,
-        }
-        if rationale_score_mode:
+        if rationale_score is None:
+            rationale_score = request.condition in {
+                Condition.GVR_RATIONALE_SCORE,
+                Condition.GVR_REFERENCE_RATIONALE_SCORE,
+            }
+        if rationale_score:
             system = (
                 self.config.rationale_score_reference_verifier_system_prompt
                 if reference_mode
@@ -2418,11 +2422,26 @@ class AletheiaOrchestrator:
             user += "\n\nPrior attempt evidence (verifier-only):\n" + json.dumps(
                 verifier_evidence, ensure_ascii=False, separators=(",", ":")
             )
-        tools = [verdict_tool]
         tool_choice = {
             "type": "function",
             "function": {"name": "submit_verdict"},
         }
+        return system, user, [verdict_tool], tool_choice, recovery_suffix
+
+    async def _verify(
+        self,
+        state: _RunState,
+        *,
+        cycle: int,
+        candidate: str,
+        keep: int,
+    ) -> VerdictRecord:
+        """Obtain a verdict, with one in-budget formatting recovery attempt."""
+
+        request = state.result.request
+        system, user, tools, tool_choice, recovery_suffix = self._verifier_request(
+            state, candidate
+        )
         recorded_calls = sorted(
             (
                 call
@@ -2577,11 +2596,17 @@ class AletheiaOrchestrator:
         completion: ChatCompletion,
         call_index: int,
         privileged_sources: Sequence[str] = (),
+        rationale_score: bool | None = None,
     ) -> VerdictRecord:
-        rationale_score_mode = request.condition in {
-            Condition.GVR_RATIONALE_SCORE,
-            Condition.GVR_REFERENCE_RATIONALE_SCORE,
-        }
+        rationale_score_mode = (
+            request.condition
+            in {
+                Condition.GVR_RATIONALE_SCORE,
+                Condition.GVR_REFERENCE_RATIONALE_SCORE,
+            }
+            if rationale_score is None
+            else rationale_score
+        )
         calls = completion.message.tool_calls
         if len(calls) != 1 or calls[0].name != "submit_verdict":
             raise _RunAbort(

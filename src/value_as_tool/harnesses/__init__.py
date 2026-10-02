@@ -29,6 +29,13 @@ BUILTIN_HARNESSES: tuple[str, ...] = (
     "value_as_tool.harnesses.cch_plan_work_review:AgentHarness",
 )
 
+# Harnesses that collect training data rather than compete as proof methods.
+DATA_COLLECTION_HARNESSES: tuple[str, ...] = (
+    "value_as_tool.harnesses.gvr_branched:AgentHarness",
+    "value_as_tool.harnesses.gvr_replan:JointPlanHarness",
+    "value_as_tool.harnesses.gvr_replan:IndependentPlanHarness",
+)
+
 
 def _load_class(entrypoint: str) -> type[Any]:
     module_name, separator, attribute = entrypoint.partition(":")
@@ -85,6 +92,7 @@ __all__ = [
     "ATTEMPT_CONDITIONED_HARNESSES",
     "ATTEMPT_CONDITIONING_MODES",
     "BUILTIN_HARNESSES",
+    "DATA_COLLECTION_HARNESSES",
     "HarnessRuntime",
     "HarnessSpec",
     "ProofHarness",

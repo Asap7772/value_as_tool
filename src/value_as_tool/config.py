@@ -27,7 +27,9 @@ Condition = Literal[
     "value_tool_rationale_score",
     "gvr_reference_rationale_score",
 ]
-Benchmark = Literal["imo_proof", "proofbench", "imo_answer"]
+Benchmark = Literal["imo_proof", "proofbench", "imo_answer", "arxivmath_train", "arxivmath_eval"]
+# Benchmarks read from a locally prepared, hash-pinned JSONL instead of the Hub.
+PREPARED_BENCHMARKS = ("arxivmath_train", "arxivmath_eval")
 VerifierFeedbackMode = Literal["legacy", "rationale_score"]
 SolverBackend = Literal["sglang", "vllm"]
 
@@ -155,6 +157,32 @@ class DatasetConfig(FrozenModel):
         return value
 
 
+class PreparedDatasetConfig(DatasetConfig):
+    """A derived split built offline from a pinned Hub revision.
+
+    ``path`` is relative to ``paths.asset_root`` and ``sha256`` pins the exact
+    prepared file, so preparation never needs network access.
+    """
+
+    path: str
+    sha256: str
+
+    @field_validator("path")
+    @classmethod
+    def relative_path(cls, value: str) -> str:
+        path = Path(value)
+        if not value.strip() or path.is_absolute() or ".." in path.parts:
+            raise ValueError("path must be a relative path inside the asset root")
+        return value
+
+    @field_validator("sha256")
+    @classmethod
+    def pinned_digest(cls, value: str) -> str:
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("sha256 must be a lowercase 64-character hex digest")
+        return value
+
+
 class DatasetsConfig(FrozenModel):
     imo_proof: DatasetConfig = DatasetConfig(
         name="lm-provers/IMOProofBench",
@@ -168,6 +196,9 @@ class DatasetsConfig(FrozenModel):
         name="Hwilner/imo-answerbench",
         revision="0258becbd00fc07d34862bc8539e61c8742f0d14",
     )
+    # Optional so that experiments which do not select them keep their identity.
+    arxivmath_train: PreparedDatasetConfig | None = None
+    arxivmath_eval: PreparedDatasetConfig | None = None
 
     def items(self) -> tuple[tuple[str, DatasetConfig], ...]:
         return tuple((name, getattr(self, name)) for name in self.__class__.model_fields)
@@ -475,6 +506,11 @@ class ExperimentConfig(FrozenModel):
             self.conditioning.source_seeds
         ):
             raise ValueError("evaluation seeds must be disjoint from conditioning seeds")
+        unconfigured = [
+            name for name in self.evaluation.benchmarks if getattr(self.datasets, name) is None
+        ]
+        if unconfigured:
+            raise ValueError(f"selected benchmarks have no dataset entry: {unconfigured}")
         rationale_conditions = {
             "gvr_rationale_score",
             "value_tool_rationale_score",
@@ -532,6 +568,10 @@ class ExperimentConfig(FrozenModel):
         if value["budget"].get("cch_stage_tokens") is None:
             # Preserve config identities for experiments using legacy CCH caps.
             value["budget"].pop("cch_stage_tokens")
+        for name in PREPARED_BENCHMARKS:
+            # Likewise for experiments created before prepared datasets existed.
+            if value["datasets"].get(name) is None:
+                value["datasets"].pop(name, None)
         evaluation = value.get("evaluation")
         if isinstance(evaluation, dict) and evaluation.get("harnesses") is None:
             # Preserve condition-only experiment identities created before the

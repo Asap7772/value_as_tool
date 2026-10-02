@@ -25,6 +25,7 @@ from value_as_tool.orchestrator import (
 )
 from value_as_tool.schemas import (
     AssistantMessage,
+    CandidateRecord,
     ChatCompletion,
     Condition,
     Role,
@@ -35,6 +36,7 @@ from value_as_tool.schemas import (
     TrajectoryStatus,
     ValueEstimateRecord,
     Verdict,
+    VerdictRecord,
 )
 
 
@@ -990,6 +992,25 @@ async def test_gvr_accepts_correct_candidate() -> None:
     assert [call.max_tokens for call in result.calls] == [60, 10]
     assert result.verdicts[0].verdict is Verdict.CORRECT
     assert result.transitions[-1].action == "correct"
+    serialized = result.to_dict()
+    for record in [*serialized["candidates"], *serialized["verdicts"]]:
+        assert "branch" not in record and "parent_call_index" not in record
+
+
+def test_tree_fields_round_trip_and_stay_out_of_linear_records() -> None:
+    linear = CandidateRecord(1, Role.GENERATOR, "Candidate.", None, 0)
+    assert "branch" not in linear.to_dict()
+    assert "parent_call_index" not in VerdictRecord(1, Verdict.CORRECT, "", "", "", 1).to_dict()
+    branched = CandidateRecord(
+        3, Role.REVISER, "Candidate.", None, 5, branch=2, parent_call_index=4
+    )
+    verdict = VerdictRecord(
+        2, Verdict.MINOR_FIX, "Fix it.", "logic", "", 6, branch=1, parent_call_index=4
+    )
+    assert CandidateRecord.from_dict(json.loads(json.dumps(branched.to_dict()))) == branched
+    assert VerdictRecord.from_dict(json.loads(json.dumps(verdict.to_dict()))) == verdict
+    with pytest.raises(ValueError, match="branch"):
+        CandidateRecord.from_dict({**linear.to_dict(), "branch": "2"})
 
 
 @pytest.mark.asyncio
